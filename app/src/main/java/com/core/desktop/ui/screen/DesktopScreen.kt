@@ -1,12 +1,11 @@
 package com.core.desktop.ui.screen
 
+import android.app.Activity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -14,6 +13,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
@@ -24,6 +24,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -32,8 +33,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.unit.dp
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import com.core.desktop.R
 import com.core.desktop.data.model.DesktopEngineState
 import com.core.desktop.ui.components.ConfigCard
@@ -58,6 +62,30 @@ fun DesktopScreen(
 
     var showLiveLogs by remember { mutableStateOf(false) }
 
+    val view = LocalView.current
+    val isRunning = engineState is DesktopEngineState.Running
+
+    DisposableEffect(isRunning, view) {
+        val activity = view.context as? Activity
+        val window = activity?.window
+        if (window != null) {
+            val controller = WindowCompat.getInsetsController(window, view)
+            if (isRunning) {
+                controller.systemBarsBehavior =
+                    WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                controller.hide(WindowInsetsCompat.Type.systemBars())
+            } else {
+                controller.show(WindowInsetsCompat.Type.systemBars())
+            }
+        }
+        onDispose {
+            if (window != null) {
+                WindowCompat.getInsetsController(window, view)
+                    .show(WindowInsetsCompat.Type.systemBars())
+            }
+        }
+    }
+
     val filePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
@@ -73,7 +101,7 @@ fun DesktopScreen(
         )
     )
 
-    BackHandler(enabled = engineState is DesktopEngineState.Running) {
+    BackHandler(enabled = isRunning) {
         viewModel.stopSession()
     }
 
@@ -82,23 +110,30 @@ fun DesktopScreen(
             .fillMaxSize()
             .background(backgroundGradient)
     ) {
-        if (engineState is DesktopEngineState.Running) {
+        if (isRunning) {
             // Live Linux Desktop View
             DesktopSurfaceView(
                 onSurfaceCreated = viewModel::onSurfaceCreated,
-                onSurfaceDestroyed = viewModel::onSurfaceDestroyed
+                onSurfaceDestroyed = viewModel::onSurfaceDestroyed,
+                onPointerEvent = viewModel::onPointerEvent
             )
 
-            // Minimalist overlay controls
+            // Bottom-aligned overlay controls so Weston top panel (launcher + clock) is unobstructed
             Column(
                 modifier = Modifier
+                    .align(Alignment.BottomEnd)
                     .fillMaxWidth()
-                    .statusBarsPadding()
+                    .navigationBarsPadding()
                     .padding(DesktopDimens.SpaceLarge)
             ) {
+                if (showLiveLogs) {
+                    LogViewerCard(logs = logs)
+                    Spacer(modifier = Modifier.height(DesktopDimens.SpaceMedium))
+                }
+
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = androidx.compose.foundation.layout.Arrangement.End
+                    horizontalArrangement = Arrangement.End
                 ) {
                     Button(
                         onClick = { showLiveLogs = !showLiveLogs },
@@ -109,7 +144,9 @@ fun DesktopScreen(
                         )
                     ) {
                         Text(
-                            text = if (showLiveLogs) "Tutup Log" else "Lihat Log",
+                            text = stringResource(
+                                if (showLiveLogs) R.string.btn_hide_logs else R.string.btn_show_logs
+                            ),
                             style = DesktopTypography.labelLarge
                         )
                     }
@@ -129,11 +166,6 @@ fun DesktopScreen(
                             style = DesktopTypography.labelLarge
                         )
                     }
-                }
-
-                if (showLiveLogs) {
-                    Spacer(modifier = Modifier.height(DesktopDimens.SpaceMedium))
-                    LogViewerCard(logs = logs)
                 }
             }
         } else {
@@ -189,4 +221,5 @@ fun DesktopScreen(
         }
     }
 }
+
 

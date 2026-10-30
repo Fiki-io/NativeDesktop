@@ -88,6 +88,10 @@ class DesktopViewModel(application: Application) : AndroidViewModel(application)
         repository.updateSurface(null)
     }
 
+    fun onPointerEvent(action: Int, normX: Float, normY: Float) {
+        repository.injectPointer(action, normX, normY)
+    }
+
     fun extractRootfsArchive(uri: Uri) {
         if (_engineState.value is DesktopEngineState.Extracting) {
             return

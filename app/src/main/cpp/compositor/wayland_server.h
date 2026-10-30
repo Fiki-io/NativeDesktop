@@ -16,6 +16,7 @@ typedef struct wayland_server wayland_server_t;
 wayland_server_t *wayland_server_create(const char *socket_dir, const char *socket_name);
 void wayland_server_set_render_callback(wayland_server_t *server, wayland_frame_render_cb cb, void *user_data);
 void wayland_server_set_output_size(wayland_server_t *server, int width, int height);
+void wayland_server_inject_pointer(wayland_server_t *server, int action, float norm_x, float norm_y);
 int wayland_server_start(wayland_server_t *server);
 void wayland_server_stop(wayland_server_t *server);
 void wayland_server_destroy(wayland_server_t *server);

@@ -27,6 +27,7 @@
 #define LOG_LINE_LEN 512
 
 static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t s_render_lock = PTHREAD_MUTEX_INITIALIZER;
 static ANativeWindow *s_window = NULL;
 static wayland_server_t *s_server = NULL;
 static pid_t s_child_pid = -1;
@@ -378,7 +379,7 @@ static void on_frame_render(const uint8_t *pixels, int width, int height, int st
 
     if (!pixels || width <= 0 || height <= 0 || stride <= 0) return;
 
-    pthread_mutex_lock(&s_lock);
+    pthread_mutex_lock(&s_render_lock);
     size_t needed = (size_t)stride * (size_t)height;
     if (needed > s_last_frame_cap) {
         uint8_t *new_buf = (uint8_t *)realloc(s_last_frame, needed);
@@ -395,7 +396,7 @@ static void on_frame_render(const uint8_t *pixels, int width, int height, int st
     }
 
     blit_frame_to_window_locked(pixels, width, height, stride);
-    pthread_mutex_unlock(&s_lock);
+    pthread_mutex_unlock(&s_render_lock);
 }
 
 static void find_dynamic_linker(const char *rootfs, char *out_ld, size_t max_len) {
@@ -445,9 +446,11 @@ Java_com_core_desktop_data_repository_DesktopEngineRepository_nativeInit(
     chmod(c_dir, 0700);
 
     pthread_mutex_lock(&s_lock);
+    pthread_mutex_lock(&s_render_lock);
     s_last_frame_w = 0;
     s_last_frame_h = 0;
     s_last_frame_stride = 0;
+    pthread_mutex_unlock(&s_render_lock);
 
     if (s_server) {
         wayland_server_destroy(s_server);
@@ -463,12 +466,13 @@ Java_com_core_desktop_data_repository_DesktopEngineRepository_nativeInit(
         return JNI_FALSE;
     }
 
-    if (s_window) {
-        int w = ANativeWindow_getWidth(s_window);
-        int h = ANativeWindow_getHeight(s_window);
-        if (w > 0 && h > 0) {
-            wayland_server_set_output_size(s_server, w, h);
-        }
+    pthread_mutex_lock(&s_render_lock);
+    int win_w = s_window ? ANativeWindow_getWidth(s_window) : 0;
+    int win_h = s_window ? ANativeWindow_getHeight(s_window) : 0;
+    pthread_mutex_unlock(&s_render_lock);
+
+    if (win_w > 0 && win_h > 0) {
+        wayland_server_set_output_size(s_server, win_w, win_h);
     }
 
     wayland_server_set_render_callback(s_server, on_frame_render, NULL);
@@ -487,7 +491,10 @@ Java_com_core_desktop_data_repository_DesktopEngineRepository_nativeSetSurface(
     JNIEnv *env, jobject thiz, jobject surface) {
     (void)thiz;
 
-    pthread_mutex_lock(&s_lock);
+    int win_w = 0;
+    int win_h = 0;
+
+    pthread_mutex_lock(&s_render_lock);
     if (s_window) {
         ANativeWindow_release(s_window);
         s_window = NULL;
@@ -496,16 +503,34 @@ Java_com_core_desktop_data_repository_DesktopEngineRepository_nativeSetSurface(
     if (surface) {
         s_window = ANativeWindow_fromSurface(env, surface);
         if (s_window) {
-            int w = ANativeWindow_getWidth(s_window);
-            int h = ANativeWindow_getHeight(s_window);
-            if (s_server && w > 0 && h > 0) {
-                wayland_server_set_output_size(s_server, w, h);
-            }
+            win_w = ANativeWindow_getWidth(s_window);
+            win_h = ANativeWindow_getHeight(s_window);
             // Immediately render cached frame if guest already committed before SurfaceView was ready
             if (s_last_frame && s_last_frame_w > 0 && s_last_frame_h > 0) {
                 blit_frame_to_window_locked(s_last_frame, s_last_frame_w, s_last_frame_h, s_last_frame_stride);
             }
         }
+    }
+    pthread_mutex_unlock(&s_render_lock);
+
+    if (win_w > 0 && win_h > 0) {
+        pthread_mutex_lock(&s_lock);
+        if (s_server) {
+            wayland_server_set_output_size(s_server, win_w, win_h);
+        }
+        pthread_mutex_unlock(&s_lock);
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_core_desktop_data_repository_DesktopEngineRepository_nativeInjectPointer(
+    JNIEnv *env, jobject thiz, jint action, jfloat norm_x, jfloat norm_y) {
+    (void)env;
+    (void)thiz;
+
+    pthread_mutex_lock(&s_lock);
+    if (s_server) {
+        wayland_server_inject_pointer(s_server, (int)action, (float)norm_x, (float)norm_y);
     }
     pthread_mutex_unlock(&s_lock);
 }
@@ -779,9 +804,11 @@ Java_com_core_desktop_data_repository_DesktopEngineRepository_nativeStopSession(
         s_server = NULL;
     }
 
+    pthread_mutex_lock(&s_render_lock);
     if (s_window) {
         ANativeWindow_release(s_window);
         s_window = NULL;
     }
+    pthread_mutex_unlock(&s_render_lock);
     pthread_mutex_unlock(&s_lock);
 }

@@ -22,6 +22,7 @@
 #define MAX_SURFACES 32
 #define MAX_FRAME_CBS 8
 #define MAX_CLIENTS 8
+#define MAX_CURSOR_DIM 128
 
 typedef struct {
     uint32_t id;
@@ -73,6 +74,15 @@ typedef struct {
     uint32_t wl_shell_id;
     uint32_t next_serial;
 
+    uint32_t pointer_entered_surface_id;
+    uint32_t cursor_surface_id;
+    int32_t cursor_hot_x;
+    int32_t cursor_hot_y;
+    uint32_t cursor_pixels[MAX_CURSOR_DIM * MAX_CURSOR_DIM];
+    int32_t cursor_w;
+    int32_t cursor_h;
+    bool has_cursor_buffer;
+
     shm_pool_t pools[MAX_POOLS];
     shm_buffer_t buffers[MAX_BUFFERS];
     surface_t surfaces[MAX_SURFACES];
@@ -85,12 +95,27 @@ struct wayland_server {
 
     int output_width;
     int output_height;
+    int last_rendered_width;
+    int last_rendered_height;
+    int32_t pointer_x;
+    int32_t pointer_y;
+
+    uint8_t *desktop_pixels;
+    size_t desktop_cap;
+    int desktop_w;
+    int desktop_h;
+    int desktop_stride;
+    uint32_t desktop_format;
+
+    uint8_t *composite_pixels;
+    size_t composite_cap;
 
     client_session_t clients[MAX_CLIENTS];
 
     wayland_frame_render_cb render_cb;
     void *render_user_data;
 
+    pthread_mutex_t lock;
     pthread_t thread;
     bool thread_started;
 };
@@ -99,6 +124,79 @@ static uint32_t get_current_time_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint32_t)((ts.tv_sec * 1000) + (ts.tv_nsec / 1000000));
+}
+
+static void present_composited_frame(wayland_server_t *server, client_session_t *client) {
+    if (!server || !server->render_cb || !server->desktop_pixels ||
+        server->desktop_w <= 0 || server->desktop_h <= 0 || server->desktop_stride <= 0) {
+        return;
+    }
+
+    if (!client || !client->has_cursor_buffer || client->cursor_w <= 0 || client->cursor_h <= 0) {
+        server->render_cb(server->desktop_pixels, server->desktop_w, server->desktop_h,
+                          server->desktop_stride, server->desktop_format, server->render_user_data);
+        return;
+    }
+
+    size_t needed = (size_t)server->desktop_stride * (size_t)server->desktop_h;
+    if (needed > server->composite_cap) {
+        uint8_t *new_buf = (uint8_t *)realloc(server->composite_pixels, needed);
+        if (!new_buf) {
+            server->render_cb(server->desktop_pixels, server->desktop_w, server->desktop_h,
+                              server->desktop_stride, server->desktop_format, server->render_user_data);
+            return;
+        }
+        server->composite_pixels = new_buf;
+        server->composite_cap = needed;
+    }
+
+    memcpy(server->composite_pixels, server->desktop_pixels, needed);
+
+    int32_t start_x = server->pointer_x - client->cursor_hot_x;
+    int32_t start_y = server->pointer_y - client->cursor_hot_y;
+
+    for (int32_t cy = 0; cy < client->cursor_h; ++cy) {
+        int32_t dy = start_y + cy;
+        if (dy < 0 || dy >= server->desktop_h) continue;
+
+        uint32_t *dst_row = (uint32_t *)(server->composite_pixels + (size_t)dy * (size_t)server->desktop_stride);
+        const uint32_t *src_row = &client->cursor_pixels[cy * client->cursor_w];
+
+        for (int32_t cx = 0; cx < client->cursor_w; ++cx) {
+            int32_t dx = start_x + cx;
+            if (dx < 0 || dx >= server->desktop_w) continue;
+
+            uint32_t sp = src_row[cx];
+            uint32_t sa = (sp >> 24) & 0xFFU;
+            if (sa == 0) continue;
+
+            if (sa == 255) {
+                dst_row[dx] = sp | 0xFF000000U;
+            } else {
+                uint32_t dp = dst_row[dx];
+                uint32_t inv_a = 255U - sa;
+                uint32_t sr = (sp >> 16) & 0xFFU;
+                uint32_t sg = (sp >> 8) & 0xFFU;
+                uint32_t sb = sp & 0xFFU;
+                uint32_t dr = (dp >> 16) & 0xFFU;
+                uint32_t dg = (dp >> 8) & 0xFFU;
+                uint32_t db = dp & 0xFFU;
+
+                // Note: Wayland ARGB8888 cursor buffers use premultiplied alpha
+                uint32_t out_r = sr + ((dr * inv_a) / 255U);
+                uint32_t out_g = sg + ((dg * inv_a) / 255U);
+                uint32_t out_b = sb + ((db * inv_a) / 255U);
+                if (out_r > 255U) out_r = 255U;
+                if (out_g > 255U) out_g = 255U;
+                if (out_b > 255U) out_b = 255U;
+
+                dst_row[dx] = 0xFF000000U | (out_r << 16) | (out_g << 8) | out_b;
+            }
+        }
+    }
+
+    server->render_cb(server->composite_pixels, server->desktop_w, server->desktop_h,
+                      server->desktop_stride, server->desktop_format, server->render_user_data);
 }
 
 static void pool_unref(shm_pool_t *pool) {
@@ -360,6 +458,7 @@ static void handle_client_message(wayland_server_t *server, client_session_t *cl
     if (object_id == client->seat_id) {
         if (opcode == WL_SEAT_GET_POINTER && payload_len >= 4) {
             client->pointer_id = *(const uint32_t *)payload;
+            client->pointer_entered_surface_id = 0;
         } else if (opcode == WL_SEAT_GET_KEYBOARD && payload_len >= 4) {
             client->keyboard_id = *(const uint32_t *)payload;
             if (client->seat_version >= 4) {
@@ -368,6 +467,27 @@ static void handle_client_message(wayland_server_t *server, client_session_t *cl
             }
         } else if (opcode == WL_SEAT_GET_TOUCH && payload_len >= 4) {
             client->touch_id = *(const uint32_t *)payload;
+        }
+        return;
+    }
+
+    if (object_id == client->pointer_id && client->pointer_id != 0) {
+        if (opcode == WL_POINTER_SET_CURSOR && payload_len >= 16) {
+            const uint32_t *p32 = (const uint32_t *)payload;
+            uint32_t surf_id = p32[1];
+            int32_t hot_x = (int32_t)p32[2];
+            int32_t hot_y = (int32_t)p32[3];
+            client->cursor_surface_id = surf_id;
+            client->cursor_hot_x = hot_x;
+            client->cursor_hot_y = hot_y;
+            if (surf_id == 0) {
+                client->has_cursor_buffer = false;
+                present_composited_frame(server, client);
+            }
+        } else if (opcode == WL_POINTER_RELEASE) {
+            send_wire_message(client->fd, WL_DISPLAY_ID, WL_DISPLAY_DELETE_ID, &object_id, sizeof(object_id));
+            client->pointer_id = 0;
+            client->pointer_entered_surface_id = 0;
         }
         return;
     }
@@ -529,6 +649,13 @@ static void handle_client_message(wayland_server_t *server, client_session_t *cl
         if (client->surfaces[i].active && client->surfaces[i].id == object_id) {
             surface_t *surf = &client->surfaces[i];
             if (opcode == WL_SURFACE_DESTROY) {
+                if (client->cursor_surface_id == surf->id) {
+                    client->cursor_surface_id = 0;
+                    client->has_cursor_buffer = false;
+                }
+                if (client->pointer_entered_surface_id == surf->id) {
+                    client->pointer_entered_surface_id = 0;
+                }
                 surf->active = false;
             } else if (opcode == WL_SURFACE_ATTACH) {
                 if (payload_len >= 4) {
@@ -542,23 +669,75 @@ static void handle_client_message(wayland_server_t *server, client_session_t *cl
                     }
                 }
             } else if (opcode == WL_SURFACE_COMMIT) {
-                if (surf->attached_buffer_id == 0 && surf->xdg_surface_id != 0) {
+                bool is_cursor = (surf->id == client->cursor_surface_id && client->cursor_surface_id != 0);
+
+                if (!is_cursor && surf->attached_buffer_id == 0 && surf->xdg_surface_id != 0) {
                     send_xdg_configure(server, client, surf);
                 }
 
                 uint32_t buf_id = surf->attached_buffer_id;
-                if (buf_id != 0) {
+                if (is_cursor) {
+                    if (buf_id == 0) {
+                        client->has_cursor_buffer = false;
+                    } else {
+                        for (int b = 0; b < MAX_BUFFERS; ++b) {
+                            if (client->buffers[b].active && client->buffers[b].id == buf_id) {
+                                shm_buffer_t *buf = &client->buffers[b];
+                                int p = buf->pool_idx;
+                                if (p >= 0 && p < MAX_POOLS &&
+                                    client->pools[p].active &&
+                                    client->pools[p].data != MAP_FAILED && client->pools[p].data != NULL &&
+                                    buf->width > 0 && buf->height > 0) {
+                                    size_t end_off = (size_t)buf->offset + (size_t)buf->stride * (size_t)buf->height;
+                                    if (end_off <= client->pools[p].size) {
+                                        int32_t cw = buf->width < MAX_CURSOR_DIM ? buf->width : MAX_CURSOR_DIM;
+                                        int32_t ch = buf->height < MAX_CURSOR_DIM ? buf->height : MAX_CURSOR_DIM;
+                                        const uint8_t *src_base = client->pools[p].data + buf->offset;
+                                        for (int32_t cy = 0; cy < ch; ++cy) {
+                                            const uint32_t *src_row = (const uint32_t *)(src_base + (size_t)cy * (size_t)buf->stride);
+                                            memcpy(&client->cursor_pixels[cy * cw], src_row, (size_t)cw * sizeof(uint32_t));
+                                        }
+                                        client->cursor_w = cw;
+                                        client->cursor_h = ch;
+                                        client->has_cursor_buffer = true;
+                                    }
+                                }
+                                send_wire_message(client->fd, buf_id, WL_BUFFER_RELEASE, NULL, 0);
+                                break;
+                            }
+                        }
+                    }
+                    present_composited_frame(server, client);
+                } else if (buf_id != 0) {
                     for (int b = 0; b < MAX_BUFFERS; ++b) {
                         if (client->buffers[b].active && client->buffers[b].id == buf_id) {
                             shm_buffer_t *buf = &client->buffers[b];
                             int p = buf->pool_idx;
                             if (p >= 0 && p < MAX_POOLS &&
                                 client->pools[p].active &&
-                                client->pools[p].data != MAP_FAILED && client->pools[p].data != NULL) {
+                                client->pools[p].data != MAP_FAILED && client->pools[p].data != NULL &&
+                                buf->width > 0 && buf->height > 0 && buf->stride > 0) {
                                 size_t end_off = (size_t)buf->offset + (size_t)buf->stride * (size_t)buf->height;
                                 if (end_off <= client->pools[p].size) {
                                     uint8_t *pixels = client->pools[p].data + buf->offset;
-                                    if (server->render_cb) {
+                                    size_t frame_bytes = (size_t)buf->stride * (size_t)buf->height;
+                                    if (frame_bytes > server->desktop_cap) {
+                                        uint8_t *new_desk = (uint8_t *)realloc(server->desktop_pixels, frame_bytes);
+                                        if (new_desk) {
+                                            server->desktop_pixels = new_desk;
+                                            server->desktop_cap = frame_bytes;
+                                        }
+                                    }
+                                    if (server->desktop_pixels && server->desktop_cap >= frame_bytes) {
+                                        memcpy(server->desktop_pixels, pixels, frame_bytes);
+                                        server->desktop_w = buf->width;
+                                        server->desktop_h = buf->height;
+                                        server->desktop_stride = buf->stride;
+                                        server->desktop_format = buf->format;
+                                        server->last_rendered_width = buf->width;
+                                        server->last_rendered_height = buf->height;
+                                        present_composited_frame(server, client);
+                                    } else if (server->render_cb) {
                                         server->render_cb(pixels, buf->width, buf->height,
                                                          buf->stride, buf->format, server->render_user_data);
                                     }
@@ -650,6 +829,7 @@ int wayland_server_dispatch_step(wayland_server_t *server, int timeout_ms) {
     struct pollfd fds[1 + MAX_CLIENTS];
     int nfds = 0;
 
+    pthread_mutex_lock(&server->lock);
     fds[0].fd = server->listen_fd;
     fds[0].events = POLLIN;
     fds[0].revents = 0;
@@ -665,10 +845,12 @@ int wayland_server_dispatch_step(wayland_server_t *server, int timeout_ms) {
             nfds++;
         }
     }
+    pthread_mutex_unlock(&server->lock);
 
     int ret = poll(fds, (nfds_t)nfds, timeout_ms);
     if (ret <= 0) return ret;
 
+    pthread_mutex_lock(&server->lock);
     if (fds[0].revents & POLLIN) {
         int client_fd = accept(server->listen_fd, NULL, NULL);
         if (client_fd >= 0) {
@@ -694,11 +876,110 @@ int wayland_server_dispatch_step(wayland_server_t *server, int timeout_ms) {
     for (int i = 1; i < nfds; ++i) {
         int c_idx = client_map[i - 1];
         if (fds[i].revents & (POLLIN | POLLHUP | POLLERR)) {
-            read_client_data(server, &server->clients[c_idx]);
+            if (server->clients[c_idx].connected) {
+                read_client_data(server, &server->clients[c_idx]);
+            }
+        }
+    }
+    pthread_mutex_unlock(&server->lock);
+
+    return 1;
+}
+
+void wayland_server_inject_pointer(wayland_server_t *server, int action, float norm_x, float norm_y) {
+    if (!server) return;
+
+    if (norm_x < 0.0f) norm_x = 0.0f;
+    if (norm_x > 1.0f) norm_x = 1.0f;
+    if (norm_y < 0.0f) norm_y = 0.0f;
+    if (norm_y > 1.0f) norm_y = 1.0f;
+
+    pthread_mutex_lock(&server->lock);
+
+    int32_t w = server->last_rendered_width > 0 ? server->last_rendered_width :
+                (server->output_width > 0 ? server->output_width : 800);
+    int32_t h = server->last_rendered_height > 0 ? server->last_rendered_height :
+                (server->output_height > 0 ? server->output_height : 1280);
+
+    int32_t px = (int32_t)(norm_x * (float)w);
+    int32_t py = (int32_t)(norm_y * (float)h);
+    if (px >= w) px = w - 1;
+    if (py >= h) py = h - 1;
+
+    server->pointer_x = px;
+    server->pointer_y = py;
+
+    int32_t sx_fixed = (int32_t)(norm_x * (float)w * 256.0f);
+    int32_t sy_fixed = (int32_t)(norm_y * (float)h * 256.0f);
+    uint32_t time_ms = get_current_time_ms();
+
+    client_session_t *active_cursor_client = NULL;
+
+    for (int i = 0; i < MAX_CLIENTS; ++i) {
+        client_session_t *client = &server->clients[i];
+        if (!client->connected || client->pointer_id == 0) continue;
+
+        uint32_t target_surf_id = 0;
+        for (int s = 0; s < MAX_SURFACES; ++s) {
+            if (!client->surfaces[s].active) continue;
+            if (client->surfaces[s].id == client->cursor_surface_id) continue;
+            if (client->surfaces[s].xdg_toplevel_id != 0 ||
+                client->surfaces[s].xdg_surface_id != 0 ||
+                client->surfaces[s].shell_surface_id != 0) {
+                target_surf_id = client->surfaces[s].id;
+                break;
+            }
+            if (target_surf_id == 0) {
+                target_surf_id = client->surfaces[s].id;
+            }
+        }
+
+        if (target_surf_id == 0) continue;
+
+        if (client->pointer_entered_surface_id != target_surf_id) {
+            uint32_t serial = ++client->next_serial;
+            uint32_t enter_payload[4];
+            enter_payload[0] = serial;
+            enter_payload[1] = target_surf_id;
+            enter_payload[2] = (uint32_t)sx_fixed;
+            enter_payload[3] = (uint32_t)sy_fixed;
+            send_wire_message(client->fd, client->pointer_id, WL_POINTER_ENTER, enter_payload, sizeof(enter_payload));
+            client->pointer_entered_surface_id = target_surf_id;
+            if (client->seat_version >= 5) {
+                send_wire_message(client->fd, client->pointer_id, WL_POINTER_FRAME, NULL, 0);
+            }
+        }
+
+        uint32_t motion_payload[3];
+        motion_payload[0] = time_ms;
+        motion_payload[1] = (uint32_t)sx_fixed;
+        motion_payload[2] = (uint32_t)sy_fixed;
+        send_wire_message(client->fd, client->pointer_id, WL_POINTER_MOTION, motion_payload, sizeof(motion_payload));
+
+        if (action == 0 || action == 1) {
+            uint32_t serial = ++client->next_serial;
+            uint32_t btn_payload[4];
+            btn_payload[0] = serial;
+            btn_payload[1] = time_ms;
+            btn_payload[2] = LINUX_BTN_LEFT;
+            btn_payload[3] = (action == 0) ? WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED;
+            send_wire_message(client->fd, client->pointer_id, WL_POINTER_BUTTON, btn_payload, sizeof(btn_payload));
+        }
+
+        if (client->seat_version >= 5) {
+            send_wire_message(client->fd, client->pointer_id, WL_POINTER_FRAME, NULL, 0);
+        }
+
+        if (client->has_cursor_buffer) {
+            active_cursor_client = client;
         }
     }
 
-    return 1;
+    if (active_cursor_client) {
+        present_composited_frame(server, active_cursor_client);
+    }
+
+    pthread_mutex_unlock(&server->lock);
 }
 
 static void *server_thread_worker(void *arg) {
@@ -713,8 +994,11 @@ wayland_server_t *wayland_server_create(const char *socket_dir, const char *sock
     wayland_server_t *server = (wayland_server_t *)calloc(1, sizeof(wayland_server_t));
     if (!server) return NULL;
 
+    pthread_mutex_init(&server->lock, NULL);
     server->output_width = 800;
     server->output_height = 1280;
+    server->pointer_x = 100;
+    server->pointer_y = 100;
 
     mkdir(socket_dir, 0700);
     chmod(socket_dir, 0700);
@@ -723,6 +1007,7 @@ wayland_server_t *wayland_server_create(const char *socket_dir, const char *sock
 
     server->listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (server->listen_fd < 0) {
+        pthread_mutex_destroy(&server->lock);
         free(server);
         return NULL;
     }
@@ -734,6 +1019,7 @@ wayland_server_t *wayland_server_create(const char *socket_dir, const char *sock
 
     if (bind(server->listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         close(server->listen_fd);
+        pthread_mutex_destroy(&server->lock);
         free(server);
         return NULL;
     }
@@ -741,6 +1027,7 @@ wayland_server_t *wayland_server_create(const char *socket_dir, const char *sock
     if (listen(server->listen_fd, 8) < 0) {
         close(server->listen_fd);
         unlink(server->socket_path);
+        pthread_mutex_destroy(&server->lock);
         free(server);
         return NULL;
     }
@@ -753,14 +1040,18 @@ wayland_server_t *wayland_server_create(const char *socket_dir, const char *sock
 
 void wayland_server_set_render_callback(wayland_server_t *server, wayland_frame_render_cb cb, void *user_data) {
     if (!server) return;
+    pthread_mutex_lock(&server->lock);
     server->render_cb = cb;
     server->render_user_data = user_data;
+    pthread_mutex_unlock(&server->lock);
 }
 
 void wayland_server_set_output_size(wayland_server_t *server, int width, int height) {
     if (!server || width <= 0 || height <= 0) return;
+    pthread_mutex_lock(&server->lock);
     server->output_width = width;
     server->output_height = height;
+    pthread_mutex_unlock(&server->lock);
 }
 
 int wayland_server_start(wayland_server_t *server) {
@@ -787,8 +1078,20 @@ void wayland_server_destroy(wayland_server_t *server) {
     if (!server) return;
     wayland_server_stop(server);
 
+    pthread_mutex_lock(&server->lock);
     for (int i = 0; i < MAX_CLIENTS; ++i) {
         client_close(&server->clients[i]);
+    }
+
+    if (server->desktop_pixels) {
+        free(server->desktop_pixels);
+        server->desktop_pixels = NULL;
+        server->desktop_cap = 0;
+    }
+    if (server->composite_pixels) {
+        free(server->composite_pixels);
+        server->composite_pixels = NULL;
+        server->composite_cap = 0;
     }
 
     if (server->listen_fd >= 0) {
@@ -796,5 +1099,7 @@ void wayland_server_destroy(wayland_server_t *server) {
         server->listen_fd = -1;
     }
     unlink(server->socket_path);
+    pthread_mutex_unlock(&server->lock);
+    pthread_mutex_destroy(&server->lock);
     free(server);
 }

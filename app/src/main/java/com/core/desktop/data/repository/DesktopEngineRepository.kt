@@ -151,6 +151,10 @@ class DesktopEngineRepository(private val context: Context) {
         nativeSetSurface(surface)
     }
 
+    fun injectPointer(action: Int, normX: Float, normY: Float) {
+        nativeInjectPointer(action, normX, normY)
+    }
+
     var processTerminatedListener: ((exitCode: Int, message: String) -> Unit)? = null
 
     fun onNativeProcessTerminated(exitCode: Int, message: String) {
@@ -235,6 +239,7 @@ class DesktopEngineRepository(private val context: Context) {
 
     private external fun nativeInit(socketDir: String, socketName: String): Boolean
     private external fun nativeSetSurface(surface: Surface?)
+    private external fun nativeInjectPointer(action: Int, normX: Float, normY: Float)
     private external fun nativeStartSession(
         rootfsPath: String,
         shimPath: String,
