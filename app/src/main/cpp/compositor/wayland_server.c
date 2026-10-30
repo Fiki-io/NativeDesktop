@@ -228,15 +228,17 @@ static void send_seat_info(client_session_t *client) {
 }
 
 static void send_xdg_configure(wayland_server_t *server, client_session_t *client, surface_t *surf) {
-    (void)server;
+    int32_t w = server->output_width > 0 ? server->output_width : 800;
+    int32_t h = server->output_height > 0 ? server->output_height : 1280;
+
     if (surf->xdg_toplevel_id != 0) {
-        // Send width=0, height=0 so the client (e.g. Weston wayland-backend) uses its own native output mode
-        // without triggering a premature mode-switch before output_enable completes.
-        uint32_t top_cfg[4];
-        top_cfg[0] = 0;
-        top_cfg[1] = 0;
-        top_cfg[2] = sizeof(uint32_t); // 1 state in array (4 bytes)
-        top_cfg[3] = XDG_TOPLEVEL_STATE_ACTIVATED;
+        // xdg_toplevel.configure: [int32 width, int32 height, array states ([FULLSCREEN=2, ACTIVATED=4])]
+        uint32_t top_cfg[5];
+        top_cfg[0] = (uint32_t)w;
+        top_cfg[1] = (uint32_t)h;
+        top_cfg[2] = 2 * sizeof(uint32_t); // 2 states in array (8 bytes)
+        top_cfg[3] = XDG_TOPLEVEL_STATE_FULLSCREEN;
+        top_cfg[4] = XDG_TOPLEVEL_STATE_ACTIVATED;
         send_wire_message(client->fd, surf->xdg_toplevel_id, XDG_TOPLEVEL_CONFIGURE, top_cfg, sizeof(top_cfg));
     }
 
