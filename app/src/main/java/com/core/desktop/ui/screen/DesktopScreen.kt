@@ -1,0 +1,192 @@
+package com.core.desktop.ui.screen
+
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.dp
+import com.core.desktop.R
+import com.core.desktop.data.model.DesktopEngineState
+import com.core.desktop.ui.components.ConfigCard
+import com.core.desktop.ui.components.DesktopSurfaceView
+import com.core.desktop.ui.components.LogViewerCard
+import com.core.desktop.ui.components.StatusIndicator
+import com.core.desktop.ui.theme.DesktopColors
+import com.core.desktop.ui.theme.DesktopDimens
+import com.core.desktop.ui.theme.DesktopTypography
+import com.core.desktop.viewmodel.DesktopViewModel
+
+@Composable
+fun DesktopScreen(
+    viewModel: DesktopViewModel,
+    modifier: Modifier = Modifier
+) {
+    val engineState by viewModel.engineState.collectAsState()
+    val config by viewModel.config.collectAsState()
+    val errorMessage by viewModel.lastErrorMessage.collectAsState()
+    val extractedBytes by viewModel.extractedBytes.collectAsState()
+    val logs by viewModel.logs.collectAsState()
+
+    var showLiveLogs by remember { mutableStateOf(false) }
+
+    val filePickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            viewModel.extractRootfsArchive(uri)
+        }
+    }
+
+    val backgroundGradient = Brush.verticalGradient(
+        colors = listOf(
+            DesktopColors.BackgroundTop,
+            DesktopColors.BackgroundBase
+        )
+    )
+
+    BackHandler(enabled = engineState is DesktopEngineState.Running) {
+        viewModel.stopSession()
+    }
+
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .background(backgroundGradient)
+    ) {
+        if (engineState is DesktopEngineState.Running) {
+            // Live Linux Desktop View
+            DesktopSurfaceView(
+                onSurfaceCreated = viewModel::onSurfaceCreated,
+                onSurfaceDestroyed = viewModel::onSurfaceDestroyed
+            )
+
+            // Minimalist overlay controls
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .statusBarsPadding()
+                    .padding(DesktopDimens.SpaceLarge)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = androidx.compose.foundation.layout.Arrangement.End
+                ) {
+                    Button(
+                        onClick = { showLiveLogs = !showLiveLogs },
+                        shape = RoundedCornerShape(DesktopDimens.ButtonCornerRadius),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (showLiveLogs) DesktopColors.Accent else DesktopColors.SurfaceInteractive,
+                            contentColor = DesktopColors.TextPrimary
+                        )
+                    ) {
+                        Text(
+                            text = if (showLiveLogs) "Tutup Log" else "Lihat Log",
+                            style = DesktopTypography.labelLarge
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.width(DesktopDimens.SpaceMedium))
+
+                    Button(
+                        onClick = viewModel::stopSession,
+                        shape = RoundedCornerShape(DesktopDimens.ButtonCornerRadius),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = DesktopColors.SurfaceInteractive,
+                            contentColor = DesktopColors.TextPrimary
+                        )
+                    ) {
+                        Text(
+                            text = stringResource(R.string.btn_stop_session),
+                            style = DesktopTypography.labelLarge
+                        )
+                    }
+                }
+
+                if (showLiveLogs) {
+                    Spacer(modifier = Modifier.height(DesktopDimens.SpaceMedium))
+                    LogViewerCard(logs = logs)
+                }
+            }
+        } else {
+            // Configuration & Status Screen
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .statusBarsPadding()
+                    .verticalScroll(rememberScrollState())
+                    .padding(DesktopDimens.SpaceExtraLarge)
+            ) {
+                Text(
+                    text = stringResource(R.string.app_name),
+                    style = DesktopTypography.headlineMedium
+                )
+
+                Spacer(modifier = Modifier.height(DesktopDimens.SpaceMedium))
+
+                StatusIndicator(
+                    state = engineState,
+                    errorMessage = errorMessage
+                )
+
+                Spacer(modifier = Modifier.height(DesktopDimens.SpaceDoubleLarge))
+
+                ConfigCard(
+                    config = config,
+                    isStarting = engineState is DesktopEngineState.Starting,
+                    isExtracting = engineState is DesktopEngineState.Extracting,
+                    extractedBytes = extractedBytes,
+                    onRootfsChange = viewModel::updateRootfsPath,
+                    onExecutableChange = viewModel::updateExecutablePath,
+                    onArgsChange = viewModel::updateSessionArgs,
+                    onStartClick = viewModel::startSession,
+                    onResetClick = viewModel::resetToDefaults,
+                    onSelectArchiveClick = {
+                        filePickerLauncher.launch(
+                            arrayOf(
+                                "application/gzip",
+                                "application/x-gzip",
+                                "application/x-tar",
+                                "application/octet-stream",
+                                "*/*"
+                            )
+                        )
+                    }
+                )
+
+                Spacer(modifier = Modifier.height(DesktopDimens.SpaceExtraLarge))
+
+                LogViewerCard(logs = logs)
+            }
+        }
+    }
+}
+

@@ -1,0 +1,104 @@
+name: Build Prebuilt Ubuntu ARM64 Desktop Rootfs
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*rootfs*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-rootfs:
+    name: Build and Release Ubuntu ARM64 Desktop
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Install Host Utilities
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget tar xz-utils python3
+
+      - name: Download Ubuntu Base 24.04 ARM64
+        run: |
+          mkdir -p work/rootfs
+          cd work
+          FILE_NAME=$(curl -s https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ | grep -o 'ubuntu-base-[^"]*arm64\.tar\.gz' | head -n 1)
+          echo "Found latest Ubuntu Base release: $FILE_NAME"
+          wget https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/$FILE_NAME -O ubuntu-base-arm64.tar.gz
+          sudo tar -xzf ubuntu-base-arm64.tar.gz -C rootfs/
+
+      - name: Configure DNS in Rootfs
+        run: |
+          sudo cp /etc/resolv.conf work/rootfs/etc/resolv.conf
+
+      - name: Install Weston & Desktop Utilities in Chroot
+        run: |
+          sudo chroot work/rootfs /bin/bash -c "
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y --no-install-recommends \
+              weston \
+              foot \
+              xkb-data \
+              fontconfig \
+              fonts-dejavu-core \
+              libpixman-1-0 \
+              dbus-user-session \
+              ca-certificates
+            fc-cache -f
+            apt-get clean
+            rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+          "
+
+      - name: Configure Minimal Weston Desktop
+        run: |
+          sudo mkdir -p work/rootfs/etc/xdg/weston work/rootfs/tmp
+          sudo chmod 1777 work/rootfs/tmp
+          sudo tee work/rootfs/etc/xdg/weston/weston.ini > /dev/null << 'EOF'
+          [core]
+          backend=wayland-backend.so
+          shell=desktop-shell.so
+          use-pixman=true
+          require-input=false
+          idle-time=0
+
+          [shell]
+          locking=false
+          animation=none
+          panel-position=top
+          background-color=0xff16202c
+
+          [launcher]
+          icon=/usr/share/weston/icon_terminal.png
+          path=/usr/bin/foot
+          EOF
+
+      - name: Clean up Host Resolv from Rootfs
+        run: |
+          sudo rm -f work/rootfs/etc/resolv.conf
+
+      - name: Package Prebuilt Rootfs
+        run: |
+          cd work/rootfs
+          sudo tar --hard-dereference -czf ../nativedesktop-ubuntu-arm64.tar.gz .
+          cd ../..
+          ls -lh work/nativedesktop-ubuntu-arm64.tar.gz
+
+      - name: Create GitHub Release & Upload Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.0-rootfs
+          name: "Prebuilt Ubuntu 24.04 ARM64 Desktop"
+          body: "Prebuilt minimal Ubuntu 24.04 ARM64 root filesystem with Weston Wayland desktop, XKB keymaps, Fontconfig, and Foot terminal ready for NativeDesktop."
+          draft: false
+          prerelease: false
+          files: work/nativedesktop-ubuntu-arm64.tar.gz
