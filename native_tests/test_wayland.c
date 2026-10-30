@@ -145,6 +145,9 @@ int main(void) {
     uint32_t buf_payload[6] = { 7, 0, (uint32_t)width, (uint32_t)height, (uint32_t)stride, WL_SHM_FORMAT_ARGB8888 };
     send_msg_with_fd(client_sock, 6, WL_SHM_POOL_CREATE_BUFFER, buf_payload, sizeof(buf_payload), -1);
 
+    // Step 6b: Destroy shm_pool immediately after creating buffer (matches Weston wayland-backend behavior)
+    send_msg_with_fd(client_sock, 6, WL_SHM_POOL_DESTROY, NULL, 0, -1);
+
     // Step 7: Attach buffer to surface (obj=5 surface, opcode=1, payload: [buf_id=7, x=0, y=0])
     uint32_t attach_payload[3] = { 7, 0, 0 };
     send_msg_with_fd(client_sock, surface_id, WL_SURFACE_ATTACH, attach_payload, sizeof(attach_payload), -1);

@@ -28,12 +28,13 @@ typedef struct {
     int fd;
     size_t size;
     uint8_t *data;
+    int ref_count;
     bool active;
 } shm_pool_t;
 
 typedef struct {
     uint32_t id;
-    uint32_t pool_id;
+    int pool_idx;
     int32_t offset;
     int32_t width;
     int32_t height;
@@ -98,6 +99,25 @@ static uint32_t get_current_time_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint32_t)((ts.tv_sec * 1000) + (ts.tv_nsec / 1000000));
+}
+
+static void pool_unref(shm_pool_t *pool) {
+    if (!pool || !pool->active) return;
+    pool->ref_count--;
+    if (pool->ref_count <= 0) {
+        if (pool->data != MAP_FAILED && pool->data != NULL) {
+            munmap(pool->data, pool->size);
+            pool->data = NULL;
+        }
+        if (pool->fd >= 0) {
+            close(pool->fd);
+            pool->fd = -1;
+        }
+        pool->id = 0;
+        pool->size = 0;
+        pool->ref_count = 0;
+        pool->active = false;
+    }
 }
 
 static int send_wire_message(int fd, uint32_t object_id, uint16_t opcode, const void *payload, size_t payload_len) {
@@ -208,14 +228,13 @@ static void send_seat_info(client_session_t *client) {
 }
 
 static void send_xdg_configure(wayland_server_t *server, client_session_t *client, surface_t *surf) {
-    int32_t w = server->output_width > 0 ? server->output_width : 800;
-    int32_t h = server->output_height > 0 ? server->output_height : 1280;
-
+    (void)server;
     if (surf->xdg_toplevel_id != 0) {
-        // xdg_toplevel.configure: [int32 width, int32 height, array states ([ACTIVATED=4])]
+        // Send width=0, height=0 so the client (e.g. Weston wayland-backend) uses its own native output mode
+        // without triggering a premature mode-switch before output_enable completes.
         uint32_t top_cfg[4];
-        top_cfg[0] = (uint32_t)w;
-        top_cfg[1] = (uint32_t)h;
+        top_cfg[0] = 0;
+        top_cfg[1] = 0;
         top_cfg[2] = sizeof(uint32_t); // 1 state in array (4 bytes)
         top_cfg[3] = XDG_TOPLEVEL_STATE_ACTIVATED;
         send_wire_message(client->fd, surf->xdg_toplevel_id, XDG_TOPLEVEL_CONFIGURE, top_cfg, sizeof(top_cfg));
@@ -231,6 +250,9 @@ static void send_xdg_configure(wayland_server_t *server, client_session_t *clien
 static void client_close(client_session_t *client) {
     if (!client->connected) return;
 
+    for (int i = 0; i < MAX_BUFFERS; ++i) {
+        client->buffers[i].active = false;
+    }
     for (int i = 0; i < MAX_POOLS; ++i) {
         if (client->pools[i].active) {
             if (client->pools[i].data != MAP_FAILED && client->pools[i].data != NULL) {
@@ -240,10 +262,8 @@ static void client_close(client_session_t *client) {
                 close(client->pools[i].fd);
             }
             client->pools[i].active = false;
+            client->pools[i].ref_count = 0;
         }
-    }
-    for (int i = 0; i < MAX_BUFFERS; ++i) {
-        client->buffers[i].active = false;
     }
     for (int i = 0; i < MAX_SURFACES; ++i) {
         client->surfaces[i].active = false;
@@ -399,6 +419,7 @@ static void handle_client_message(wayland_server_t *server, client_session_t *cl
                     client->pools[i].fd = pool_fd;
                     client->pools[i].size = (size_t)pool_size;
                     client->pools[i].data = (uint8_t *)mmap(NULL, (size_t)pool_size, PROT_READ, MAP_SHARED, pool_fd, 0);
+                    client->pools[i].ref_count = 1;
                     client->pools[i].active = true;
                     pool_fd = -1;
                     break;
@@ -411,7 +432,7 @@ static void handle_client_message(wayland_server_t *server, client_session_t *cl
 
     // Check if object is a shm_pool
     for (int i = 0; i < MAX_POOLS; ++i) {
-        if (client->pools[i].active && client->pools[i].id == object_id) {
+        if (client->pools[i].active && client->pools[i].id == object_id && object_id != 0) {
             if (opcode == WL_SHM_POOL_CREATE_BUFFER && payload_len >= 24) {
                 const uint32_t *p32 = (const uint32_t *)payload;
                 uint32_t buf_id = p32[0];
@@ -423,8 +444,12 @@ static void handle_client_message(wayland_server_t *server, client_session_t *cl
 
                 for (int b = 0; b < MAX_BUFFERS; ++b) {
                     if (!client->buffers[b].active || client->buffers[b].id == buf_id) {
+                        if (client->buffers[b].active && client->buffers[b].pool_idx >= 0 && client->buffers[b].pool_idx < MAX_POOLS) {
+                            pool_unref(&client->pools[client->buffers[b].pool_idx]);
+                        }
+                        client->pools[i].ref_count++;
                         client->buffers[b].id = buf_id;
-                        client->buffers[b].pool_id = client->pools[i].id;
+                        client->buffers[b].pool_idx = i;
                         client->buffers[b].offset = offset;
                         client->buffers[b].width = width;
                         client->buffers[b].height = height;
@@ -435,15 +460,14 @@ static void handle_client_message(wayland_server_t *server, client_session_t *cl
                     }
                 }
             } else if (opcode == WL_SHM_POOL_DESTROY) {
-                client->pools[i].active = false;
-                if (client->pools[i].data != MAP_FAILED && client->pools[i].data != NULL) {
-                    munmap(client->pools[i].data, client->pools[i].size);
-                    client->pools[i].data = NULL;
-                }
+                // In Wayland, destroying wl_shm_pool releases the protocol ID immediately,
+                // while the underlying mmap stays valid until all wl_buffers from this pool are destroyed.
+                client->pools[i].id = 0;
                 if (client->pools[i].fd >= 0) {
                     close(client->pools[i].fd);
                     client->pools[i].fd = -1;
                 }
+                pool_unref(&client->pools[i]);
                 send_wire_message(client->fd, WL_DISPLAY_ID, WL_DISPLAY_DELETE_ID, &object_id, sizeof(object_id));
             } else if (opcode == WL_SHM_POOL_RESIZE && payload_len >= 4) {
                 int32_t new_size = *(const int32_t *)payload;
@@ -463,7 +487,11 @@ static void handle_client_message(wayland_server_t *server, client_session_t *cl
     for (int b = 0; b < MAX_BUFFERS; ++b) {
         if (client->buffers[b].active && client->buffers[b].id == object_id) {
             if (opcode == WL_BUFFER_DESTROY) {
+                int p_idx = client->buffers[b].pool_idx;
                 client->buffers[b].active = false;
+                if (p_idx >= 0 && p_idx < MAX_POOLS) {
+                    pool_unref(&client->pools[p_idx]);
+                }
                 send_wire_message(client->fd, WL_DISPLAY_ID, WL_DISPLAY_DELETE_ID, &object_id, sizeof(object_id));
             }
             return;
@@ -512,7 +540,7 @@ static void handle_client_message(wayland_server_t *server, client_session_t *cl
                     }
                 }
             } else if (opcode == WL_SURFACE_COMMIT) {
-                if (surf->attached_buffer_id == 0 && surf->xdg_surface_id != 0 && !surf->configured) {
+                if (surf->attached_buffer_id == 0 && surf->xdg_surface_id != 0) {
                     send_xdg_configure(server, client, surf);
                 }
 
@@ -521,18 +549,17 @@ static void handle_client_message(wayland_server_t *server, client_session_t *cl
                     for (int b = 0; b < MAX_BUFFERS; ++b) {
                         if (client->buffers[b].active && client->buffers[b].id == buf_id) {
                             shm_buffer_t *buf = &client->buffers[b];
-                            for (int p = 0; p < MAX_POOLS; ++p) {
-                                if (client->pools[p].active && client->pools[p].id == buf->pool_id &&
-                                    client->pools[p].data != MAP_FAILED && client->pools[p].data != NULL) {
-                                    size_t end_off = (size_t)buf->offset + (size_t)buf->stride * (size_t)buf->height;
-                                    if (end_off <= client->pools[p].size) {
-                                        uint8_t *pixels = client->pools[p].data + buf->offset;
-                                        if (server->render_cb) {
-                                            server->render_cb(pixels, buf->width, buf->height,
-                                                             buf->stride, buf->format, server->render_user_data);
-                                        }
+                            int p = buf->pool_idx;
+                            if (p >= 0 && p < MAX_POOLS &&
+                                client->pools[p].active &&
+                                client->pools[p].data != MAP_FAILED && client->pools[p].data != NULL) {
+                                size_t end_off = (size_t)buf->offset + (size_t)buf->stride * (size_t)buf->height;
+                                if (end_off <= client->pools[p].size) {
+                                    uint8_t *pixels = client->pools[p].data + buf->offset;
+                                    if (server->render_cb) {
+                                        server->render_cb(pixels, buf->width, buf->height,
+                                                         buf->stride, buf->format, server->render_user_data);
                                     }
-                                    break;
                                 }
                             }
                             send_wire_message(client->fd, buf_id, WL_BUFFER_RELEASE, NULL, 0);
