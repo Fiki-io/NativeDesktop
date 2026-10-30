@@ -695,7 +695,7 @@ int __lxstat64(int ver, const char *pathname, struct stat *statbuf) {
     return newfstatat(AT_FDCWD, pathname, statbuf, AT_SYMLINK_NOFOLLOW);
 }
 
-int statx(int dirfd, const char *pathname, int flags, unsigned int mask, void *statxbuf) {
+int statx(int dirfd, const char *pathname, int flags, unsigned int mask, struct statx *statxbuf) {
     (void)dirfd;
     (void)pathname;
     (void)flags;

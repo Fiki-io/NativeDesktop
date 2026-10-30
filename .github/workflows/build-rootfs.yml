@@ -36,16 +36,23 @@ jobs:
           wget https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/$FILE_NAME -O ubuntu-base-arm64.tar.gz
           sudo tar -xzf ubuntu-base-arm64.tar.gz -C rootfs/
 
-      - name: Configure DNS in Rootfs
+      - name: Configure DNS & Mount Pseudo-Filesystems in Rootfs
         run: |
-          sudo cp /etc/resolv.conf work/rootfs/etc/resolv.conf
+          sudo rm -f work/rootfs/etc/resolv.conf
+          echo "nameserver 8.8.8.8" | sudo tee work/rootfs/etc/resolv.conf
+          sudo mkdir -p work/rootfs/dev work/rootfs/dev/pts work/rootfs/proc work/rootfs/sys work/rootfs/tmp
+          sudo chmod 1777 work/rootfs/tmp
+          sudo mount --bind /dev work/rootfs/dev
+          sudo mount --bind /dev/pts work/rootfs/dev/pts
+          sudo mount -t proc proc work/rootfs/proc
+          sudo mount -t sysfs sysfs work/rootfs/sys
 
       - name: Install Weston & Desktop Utilities in Chroot
         run: |
-          sudo chroot work/rootfs /bin/bash -c "
+          sudo chroot work/rootfs /bin/bash -e -c "
             export DEBIAN_FRONTEND=noninteractive
-            apt-get update
-            apt-get install -y --no-install-recommends \
+            apt-get -o APT::Sandbox::User=root update
+            apt-get -o APT::Sandbox::User=root install -y --no-install-recommends \
               weston \
               foot \
               xkb-data \
@@ -55,6 +62,8 @@ jobs:
               dbus-user-session \
               ca-certificates
             fc-cache -f
+            test -x /usr/bin/weston
+            test -x /usr/bin/foot
             apt-get clean
             rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
           "
@@ -82,14 +91,22 @@ jobs:
           path=/usr/bin/foot
           EOF
 
-      - name: Clean up Host Resolv from Rootfs
+      - name: Unmount Pseudo-Filesystems & Clean Up Rootfs
         run: |
+          sudo umount -lf work/rootfs/sys || true
+          sudo umount -lf work/rootfs/proc || true
+          sudo umount -lf work/rootfs/dev/pts || true
+          sudo umount -lf work/rootfs/dev || true
           sudo rm -f work/rootfs/etc/resolv.conf
 
       - name: Package Prebuilt Rootfs
         run: |
           cd work/rootfs
-          sudo tar --hard-dereference -czf ../nativedesktop-ubuntu-arm64.tar.gz .
+          sudo tar --hard-dereference \
+            --exclude='./dev/*' \
+            --exclude='./proc/*' \
+            --exclude='./sys/*' \
+            -czf ../nativedesktop-ubuntu-arm64.tar.gz .
           cd ../..
           ls -lh work/nativedesktop-ubuntu-arm64.tar.gz
 
