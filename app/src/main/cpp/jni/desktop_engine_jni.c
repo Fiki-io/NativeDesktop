@@ -222,19 +222,42 @@ static void patch_directory_recursive(const char *dir_path, int depth) {
 }
 
 static void write_weston_config(const char *rootfs) {
+    char root_home[PATH_MAX];
     char etc_dir[PATH_MAX];
     char xdg_dir[PATH_MAX];
     char weston_dir[PATH_MAX];
+    char foot_dir[PATH_MAX];
     char ini_path[PATH_MAX];
+    char foot_ini_path[PATH_MAX];
 
+    snprintf(root_home, sizeof(root_home), "%s/root", rootfs);
     snprintf(etc_dir, sizeof(etc_dir), "%s/etc", rootfs);
     snprintf(xdg_dir, sizeof(xdg_dir), "%s/etc/xdg", rootfs);
     snprintf(weston_dir, sizeof(weston_dir), "%s/etc/xdg/weston", rootfs);
+    snprintf(foot_dir, sizeof(foot_dir), "%s/etc/xdg/foot", rootfs);
     snprintf(ini_path, sizeof(ini_path), "%s/etc/xdg/weston/weston.ini", rootfs);
+    snprintf(foot_ini_path, sizeof(foot_ini_path), "%s/etc/xdg/foot/foot.ini", rootfs);
 
+    mkdir(root_home, 0755);
     mkdir(etc_dir, 0755);
     mkdir(xdg_dir, 0755);
     mkdir(weston_dir, 0755);
+    mkdir(foot_dir, 0755);
+
+    FILE *ffp = fopen(foot_ini_path, "w");
+    if (ffp) {
+        fprintf(ffp,
+            "[main]\n"
+            "shell=/bin/bash\n"
+            "term=xterm-256color\n"
+            "font=monospace:size=11\n"
+            "pad=8x8\n\n"
+            "[csd]\n"
+            "preferred=client\n"
+            "size=26\n"
+        );
+        fclose(ffp);
+    }
 
     FILE *fp = fopen(ini_path, "w");
     if (fp) {
@@ -252,7 +275,8 @@ static void write_weston_config(const char *rootfs) {
             "background-color=0xff16202c\n\n"
             "[launcher]\n"
             "icon=%s/usr/share/weston/icon_terminal.png\n"
-            "path=/usr/bin/foot\n",
+            "path=/usr/bin/foot -c %s/etc/xdg/foot/foot.ini -l error /bin/bash\n",
+            rootfs,
             rootfs
         );
         fclose(fp);
@@ -535,6 +559,19 @@ Java_com_core_desktop_data_repository_DesktopEngineRepository_nativeInjectPointe
     pthread_mutex_unlock(&s_lock);
 }
 
+JNIEXPORT void JNICALL
+Java_com_core_desktop_data_repository_DesktopEngineRepository_nativeInjectKey(
+    JNIEnv *env, jobject thiz, jint linux_keycode, jboolean pressed, jboolean shift_mod) {
+    (void)env;
+    (void)thiz;
+
+    pthread_mutex_lock(&s_lock);
+    if (s_server) {
+        wayland_server_inject_key(s_server, (int)linux_keycode, (bool)pressed, (bool)shift_mod);
+    }
+    pthread_mutex_unlock(&s_lock);
+}
+
 JNIEXPORT jboolean JNICALL
 Java_com_core_desktop_data_repository_DesktopEngineRepository_nativeStartSession(
     JNIEnv *env, jobject thiz,
@@ -602,7 +639,7 @@ Java_com_core_desktop_data_repository_DesktopEngineRepository_nativeStartSession
     }
 
     int custom_env_count = (*env)->GetArrayLength(env, env_vars);
-    char **envp = (char **)calloc((size_t)custom_env_count + 24, sizeof(char *));
+    char **envp = (char **)calloc((size_t)custom_env_count + 32, sizeof(char *));
     for (int i = 0; i < custom_env_count; ++i) {
         jstring var = (jstring)(*env)->GetObjectArrayElement(env, env_vars, i);
         const char *var_str = (*env)->GetStringUTFChars(env, var, NULL);
@@ -633,6 +670,9 @@ Java_com_core_desktop_data_repository_DesktopEngineRepository_nativeStartSession
     snprintf(buf, sizeof(buf), "TMPDIR=%s", c_sockdir);
     envp[idx++] = strdup(buf);
 
+    snprintf(buf, sizeof(buf), "LOCPATH=%s/usr/lib/locale", c_rootfs);
+    envp[idx++] = strdup(buf);
+
     snprintf(buf, sizeof(buf), "XKB_CONFIG_ROOT=%s/usr/share/X11/xkb", c_rootfs);
     envp[idx++] = strdup(buf);
 
@@ -651,14 +691,18 @@ Java_com_core_desktop_data_repository_DesktopEngineRepository_nativeStartSession
     snprintf(buf, sizeof(buf), "XDG_DATA_DIRS=%s/usr/local/share:%s/usr/share:/usr/local/share:/usr/share", c_rootfs, c_rootfs);
     envp[idx++] = strdup(buf);
 
+    snprintf(buf, sizeof(buf), "HOME=%s/root", c_rootfs);
+    envp[idx++] = strdup(buf);
+
     envp[idx++] = strdup("WAYLAND_DISPLAY=wayland-0");
     envp[idx++] = strdup("XDG_SESSION_TYPE=wayland");
-    envp[idx++] = strdup("HOME=/root");
     envp[idx++] = strdup("USER=root");
     envp[idx++] = strdup("LOGNAME=root");
-    envp[idx++] = strdup("SHELL=/bin/sh");
+    envp[idx++] = strdup("SHELL=/bin/bash");
+    envp[idx++] = strdup("TERM=xterm-256color");
     envp[idx++] = strdup("PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin:/usr/libexec");
     envp[idx++] = strdup("LANG=C.UTF-8");
+    envp[idx++] = strdup("LC_ALL=C.UTF-8");
     envp[idx] = NULL;
 
     int pipefd[2] = { -1, -1 };

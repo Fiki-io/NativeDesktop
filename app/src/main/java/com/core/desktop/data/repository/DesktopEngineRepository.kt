@@ -155,6 +155,10 @@ class DesktopEngineRepository(private val context: Context) {
         nativeInjectPointer(action, normX, normY)
     }
 
+    fun injectKey(linuxKeycode: Int, pressed: Boolean, shiftMod: Boolean) {
+        nativeInjectKey(linuxKeycode, pressed, shiftMod)
+    }
+
     var processTerminatedListener: ((exitCode: Int, message: String) -> Unit)? = null
 
     fun onNativeProcessTerminated(exitCode: Int, message: String) {
@@ -240,6 +244,7 @@ class DesktopEngineRepository(private val context: Context) {
     private external fun nativeInit(socketDir: String, socketName: String): Boolean
     private external fun nativeSetSurface(surface: Surface?)
     private external fun nativeInjectPointer(action: Int, normX: Float, normY: Float)
+    private external fun nativeInjectKey(linuxKeycode: Int, pressed: Boolean, shiftMod: Boolean)
     private external fun nativeStartSession(
         rootfsPath: String,
         shimPath: String,

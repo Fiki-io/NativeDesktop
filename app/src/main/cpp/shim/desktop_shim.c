@@ -1064,3 +1064,163 @@ int execvp(const char *file, char *const argv[]) {
     char **env = environ ? environ : NULL;
     return execvpe(file, argv, env);
 }
+
+// Locale & UTF-8 enforcement so terminals (foot) and GUI apps never fail when glibc
+// attempts internal __open_nocancel("/usr/lib/locale/...") on Android
+char *setlocale(int category, const char *locale) {
+    (void)category;
+    (void)locale;
+    return (char *)"C.UTF-8";
+}
+
+char *nl_langinfo(int item) {
+    // In glibc <langinfo.h>, CODESET == 14 (_NL_CTYPE_CODESET_NAME)
+    if (item == 14) {
+        return (char *)"UTF-8";
+    }
+    // RADIXCHAR == 65536 (0x10000)
+    if (item == 0x10000) {
+        return (char *)".";
+    }
+    return (char *)"";
+}
+
+char *nl_langinfo_l(int item, void *loc) {
+    (void)loc;
+    return nl_langinfo(item);
+}
+
+// User identity & passwd lookup shims so unprivileged Android app UIDs resolve cleanly to root + /bin/bash
+struct shim_passwd {
+    char *pw_name;
+    char *pw_passwd;
+    uid_t pw_uid;
+    gid_t pw_gid;
+    char *pw_gecos;
+    char *pw_dir;
+    char *pw_shell;
+};
+
+static struct shim_passwd s_pw;
+static char s_pw_dir[PATH_MAX];
+static char s_pw_shell[PATH_MAX];
+
+static struct shim_passwd *populate_shim_passwd(uid_t uid) {
+    ensure_rootfs_loaded();
+    if (s_rootfs != NULL && s_rootfs_len > 0) {
+        shim_concat2(s_pw_dir, sizeof(s_pw_dir), s_rootfs, "/root");
+        char bash_check[PATH_MAX];
+        shim_concat2(bash_check, sizeof(bash_check), s_rootfs, "/bin/bash");
+        if (raw_syscall4(__NR_faccessat, AT_FDCWD, (long)bash_check, X_OK, 0) == 0) {
+            shim_strncpy(s_pw_shell, "/bin/bash", sizeof(s_pw_shell));
+        } else {
+            shim_strncpy(s_pw_shell, "/bin/sh", sizeof(s_pw_shell));
+        }
+    } else {
+        shim_strncpy(s_pw_dir, "/root", sizeof(s_pw_dir));
+        shim_strncpy(s_pw_shell, "/bin/sh", sizeof(s_pw_shell));
+    }
+    s_pw.pw_name = (char *)"root";
+    s_pw.pw_passwd = (char *)"x";
+    s_pw.pw_uid = uid;
+    s_pw.pw_gid = 0;
+    s_pw.pw_gecos = (char *)"root";
+    s_pw.pw_dir = s_pw_dir;
+    s_pw.pw_shell = s_pw_shell;
+    return &s_pw;
+}
+
+void *getpwuid(uid_t uid) {
+    return populate_shim_passwd(uid);
+}
+
+void *getpwnam(const char *name) {
+    (void)name;
+    return populate_shim_passwd(0);
+}
+
+int getpwuid_r(uid_t uid, void *pwd, char *buf, size_t buflen, void **result) {
+    (void)buf;
+    (void)buflen;
+    struct shim_passwd *src = populate_shim_passwd(uid);
+    if (pwd) {
+        memcpy(pwd, src, sizeof(struct shim_passwd));
+    }
+    if (result) {
+        *result = pwd;
+    }
+    return 0;
+}
+
+int getpwnam_r(const char *name, void *pwd, char *buf, size_t buflen, void **result) {
+    (void)name;
+    return getpwuid_r(0, pwd, buf, buflen, result);
+}
+
+// Pseudo-terminal (PTY) shims so terminal emulators (foot) can allocate /dev/pts/<N> on Android
+#ifndef TIOCSPTLCK
+#define TIOCSPTLCK 0x40045431
+#endif
+#ifndef TIOCGPTN
+#define TIOCGPTN 0x80045430
+#endif
+
+int posix_openpt(int flags) {
+    return (int)set_errno_return(raw_syscall4(__NR_openat, AT_FDCWD, (long)"/dev/ptmx", flags, 0));
+}
+
+int grantpt(int fd) {
+    (void)fd;
+    return 0;
+}
+
+int unlockpt(int fd) {
+    int unlock = 0;
+    return (int)set_errno_return(raw_syscall3(__NR_ioctl, fd, TIOCSPTLCK, (long)&unlock));
+}
+
+static void format_uint_str(unsigned int val, char *out, size_t max_len) {
+    if (!out || max_len == 0) return;
+    char tmp[16];
+    int pos = 0;
+    if (val == 0) {
+        tmp[pos++] = '0';
+    } else {
+        while (val > 0 && pos < 15) {
+            tmp[pos++] = (char)('0' + (val % 10));
+            val /= 10;
+        }
+    }
+    size_t i = 0;
+    while (pos > 0 && i < max_len - 1) {
+        out[i++] = tmp[--pos];
+    }
+    out[i] = '\0';
+}
+
+int ptsname_r(int fd, char *buf, size_t buflen) {
+    if (!buf || buflen < 16) {
+        set_errno_val(ERANGE);
+        return ERANGE;
+    }
+    unsigned int pty_num = 0;
+    long ret = raw_syscall3(__NR_ioctl, fd, TIOCGPTN, (long)&pty_num);
+    if (ret < 0) {
+        int err = (int)(-ret);
+        set_errno_val(err);
+        return err;
+    }
+    char num_str[16];
+    format_uint_str(pty_num, num_str, sizeof(num_str));
+    shim_concat2(buf, buflen, "/dev/pts/", num_str);
+    return 0;
+}
+
+char *ptsname(int fd) {
+    static char s_pts_buf[64];
+    if (ptsname_r(fd, s_pts_buf, sizeof(s_pts_buf)) != 0) {
+        return NULL;
+    }
+    return s_pts_buf;
+}
+

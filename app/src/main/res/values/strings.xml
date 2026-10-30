@@ -19,6 +19,7 @@
 
     <string name="btn_start_session">Jalankan Sesi Desktop</string>
     <string name="btn_stop_session">Hentikan Sesi</string>
+    <string name="btn_toggle_keyboard">Keyboard</string>
     <string name="btn_show_logs">Lihat Log</string>
     <string name="btn_hide_logs">Tutup Log</string>
     <string name="btn_reset_defaults">Gunakan Jalur Default</string>

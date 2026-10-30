@@ -92,6 +92,10 @@ class DesktopViewModel(application: Application) : AndroidViewModel(application)
         repository.injectPointer(action, normX, normY)
     }
 
+    fun onKeyEvent(linuxKeycode: Int, pressed: Boolean, shiftMod: Boolean = false) {
+        repository.injectKey(linuxKeycode, pressed, shiftMod)
+    }
+
     fun extractRootfsArchive(uri: Uri) {
         if (_engineState.value is DesktopEngineState.Extracting) {
             return

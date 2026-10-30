@@ -1,6 +1,8 @@
 package com.core.desktop.ui.screen
 
 import android.app.Activity
+import android.content.pm.ActivityInfo
+import android.view.WindowManager
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -27,6 +29,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -61,25 +64,34 @@ fun DesktopScreen(
     val logs by viewModel.logs.collectAsState()
 
     var showLiveLogs by remember { mutableStateOf(false) }
+    var keyboardToggleCount by remember { mutableIntStateOf(0) }
 
     val view = LocalView.current
     val isRunning = engineState is DesktopEngineState.Running
+    val isDesktopSessionActive =
+        engineState is DesktopEngineState.Starting || engineState is DesktopEngineState.Running
 
-    DisposableEffect(isRunning, view) {
+    DisposableEffect(isDesktopSessionActive, view) {
         val activity = view.context as? Activity
         val window = activity?.window
-        if (window != null) {
+        if (activity != null && window != null) {
             val controller = WindowCompat.getInsetsController(window, view)
-            if (isRunning) {
+            if (isDesktopSessionActive) {
+                activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING)
                 controller.systemBarsBehavior =
                     WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
                 controller.hide(WindowInsetsCompat.Type.systemBars())
             } else {
+                activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
                 controller.show(WindowInsetsCompat.Type.systemBars())
             }
         }
         onDispose {
-            if (window != null) {
+            if (activity != null && window != null) {
+                activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
                 WindowCompat.getInsetsController(window, view)
                     .show(WindowInsetsCompat.Type.systemBars())
             }
@@ -115,7 +127,9 @@ fun DesktopScreen(
             DesktopSurfaceView(
                 onSurfaceCreated = viewModel::onSurfaceCreated,
                 onSurfaceDestroyed = viewModel::onSurfaceDestroyed,
-                onPointerEvent = viewModel::onPointerEvent
+                onPointerEvent = viewModel::onPointerEvent,
+                onKeyEvent = viewModel::onKeyEvent,
+                keyboardToggleCount = keyboardToggleCount
             )
 
             // Bottom-aligned overlay controls so Weston top panel (launcher + clock) is unobstructed
@@ -135,6 +149,22 @@ fun DesktopScreen(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.End
                 ) {
+                    Button(
+                        onClick = { keyboardToggleCount++ },
+                        shape = RoundedCornerShape(DesktopDimens.ButtonCornerRadius),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = DesktopColors.SurfaceInteractive,
+                            contentColor = DesktopColors.TextPrimary
+                        )
+                    ) {
+                        Text(
+                            text = stringResource(R.string.btn_toggle_keyboard),
+                            style = DesktopTypography.labelLarge
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.width(DesktopDimens.SpaceMedium))
+
                     Button(
                         onClick = { showLiveLogs = !showLiveLogs },
                         shape = RoundedCornerShape(DesktopDimens.ButtonCornerRadius),
