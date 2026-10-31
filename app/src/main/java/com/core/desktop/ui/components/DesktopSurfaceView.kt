@@ -190,6 +190,20 @@ private fun mapAndroidKeyCodeToLinux(keyCode: Int): Int? {
         KeyEvent.KEYCODE_COMMA -> 51
         KeyEvent.KEYCODE_PERIOD -> 52
         KeyEvent.KEYCODE_SLASH -> 53
+        KeyEvent.KEYCODE_SHIFT_LEFT -> 42   // KEY_LEFTSHIFT
+        KeyEvent.KEYCODE_SHIFT_RIGHT -> 54  // KEY_RIGHTSHIFT
+        KeyEvent.KEYCODE_CTRL_LEFT -> 29    // KEY_LEFTCTRL
+        KeyEvent.KEYCODE_CTRL_RIGHT -> 97   // KEY_RIGHTCTRL
+        KeyEvent.KEYCODE_ALT_LEFT -> 56     // KEY_LEFTALT
+        KeyEvent.KEYCODE_ALT_RIGHT -> 100   // KEY_RIGHTALT
+        KeyEvent.KEYCODE_BUTTON_A -> 57     // KEY_SPACE (Jump / Confirm)
+        KeyEvent.KEYCODE_BUTTON_B -> 1      // KEY_ESC (Back / Cancel)
+        KeyEvent.KEYCODE_BUTTON_X -> 18     // KEY_E (Interact)
+        KeyEvent.KEYCODE_BUTTON_Y -> 19     // KEY_R (Reload / Action)
+        KeyEvent.KEYCODE_BUTTON_L1 -> 42    // KEY_LEFTSHIFT (Sprint)
+        KeyEvent.KEYCODE_BUTTON_R1 -> 33    // KEY_F (Use / Melee)
+        KeyEvent.KEYCODE_BUTTON_START -> 28 // KEY_ENTER
+        KeyEvent.KEYCODE_BUTTON_SELECT -> 15 // KEY_TAB
         else -> null
     }
 }

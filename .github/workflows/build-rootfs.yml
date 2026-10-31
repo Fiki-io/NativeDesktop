@@ -1,8 +1,12 @@
-name: Build Prebuilt Ubuntu ARM64 Desktop Rootfs
+name: Build Windows Game Engine Rootfs (ARM64 + Box64 + Wine + DXVK)
 
 on:
   workflow_dispatch:
   push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build-rootfs.yml'
     tags:
       - 'v*rootfs*'
 
@@ -11,13 +15,13 @@ permissions:
 
 jobs:
   build-rootfs:
-    name: Build and Release Ubuntu ARM64 Desktop
+    name: Build Ubuntu ARM64 + Box64 + Wine Wayland + DXVK Rootfs
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Set up QEMU
+      - name: Set up QEMU ARM64
         uses: docker/setup-qemu-action@v3
         with:
           platforms: arm64
@@ -25,18 +29,18 @@ jobs:
       - name: Install Host Utilities
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget tar xz-utils python3
+          sudo apt-get install -y wget curl tar xz-utils zstd gnupg ca-certificates python3
 
       - name: Download Ubuntu Base 24.04 ARM64
         run: |
           mkdir -p work/rootfs
           cd work
           FILE_NAME=$(curl -s https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ | grep -o 'ubuntu-base-[^"]*arm64\.tar\.gz' | head -n 1)
-          echo "Found latest Ubuntu Base release: $FILE_NAME"
-          wget https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/$FILE_NAME -O ubuntu-base-arm64.tar.gz
+          echo "Found Ubuntu Base release: $FILE_NAME"
+          wget -q https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/$FILE_NAME -O ubuntu-base-arm64.tar.gz
           sudo tar -xzf ubuntu-base-arm64.tar.gz -C rootfs/
 
-      - name: Configure DNS & Mount Pseudo-Filesystems in Rootfs
+      - name: Configure DNS & Mount Pseudo-Filesystems
         run: |
           sudo rm -f work/rootfs/etc/resolv.conf
           echo "nameserver 8.8.8.8" | sudo tee work/rootfs/etc/resolv.conf
@@ -47,51 +51,236 @@ jobs:
           sudo mount -t proc proc work/rootfs/proc
           sudo mount -t sysfs sysfs work/rootfs/sys
 
-      - name: Install Weston & Desktop Utilities in Chroot
+      - name: Install Multi-SoC Graphics Stack, Wayland, and Box64 in ARM64 Chroot
         run: |
           sudo chroot work/rootfs /bin/bash -e -c "
             export DEBIAN_FRONTEND=noninteractive
             apt-get -o APT::Sandbox::User=root update
             apt-get -o APT::Sandbox::User=root install -y --no-install-recommends \
+              ca-certificates \
+              wget \
+              gnupg \
               weston \
+              xwayland \
               foot \
               xkb-data \
               fontconfig \
               fonts-dejavu-core \
               libpixman-1-0 \
+              libwayland-client0 \
+              libwayland-server0 \
+              libwayland-egl1 \
+              libxkbcommon0 \
+              libvulkan1 \
+              mesa-vulkan-drivers \
+              vulkan-tools \
+              libgl1 \
+              libgl1-mesa-dri \
+              libegl1 \
+              libgles2 \
+              libgbm1 \
+              libdrm2 \
+              libx11-6 \
+              libxext6 \
+              libxrender1 \
+              libxrandr2 \
+              libxi6 \
+              libxcursor1 \
+              libxcomposite1 \
+              libxdamage1 \
+              libxfixes3 \
+              libxxf86vm1 \
+              libxinerama1 \
+              libasound2t64 \
+              libpulse0 \
+              libopenal1 \
+              libsdl2-2.0-0 \
+              libfreetype6 \
+              libgnutls30t64 \
+              libdbus-1-3 \
               dbus-user-session \
-              ca-certificates
+              procps \
+              util-linux
+
+            # Add official Box64 ARM64 repository (Generic ARM64 build for Snapdragon + MediaTek + Exynos + Tensor)
+            wget -qO- https://ryanfortner.github.io/box64-debs/KEY.gpg | gpg --dearmor -o /etc/apt/trusted.gpg.d/box64-debs-archive-keyring.gpg
+            echo 'deb [signed-by=/etc/apt/trusted.gpg.d/box64-debs-archive-keyring.gpg] https://ryanfortner.github.io/box64-debs/debian ./' > /etc/apt/sources.list.d/box64.list
+            apt-get -o APT::Sandbox::User=root update
+            apt-get -o APT::Sandbox::User=root install -y --no-install-recommends box64-arm64 || \
+              apt-get -o APT::Sandbox::User=root install -y --no-install-recommends box64-android || \
+              apt-get -o APT::Sandbox::User=root install -y --no-install-recommends box64
+
             fc-cache -f
-            test -x /usr/bin/weston
-            test -x /usr/bin/foot
+            test -x /usr/local/bin/box64 || test -x /usr/bin/box64
             apt-get clean
             rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
           "
 
-      - name: Configure Minimal Weston Desktop
+      - name: Bundle Wine WoW64 (Wayland + x86_64/x86 Support) & DXVK on Host
         run: |
-          sudo mkdir -p work/rootfs/etc/xdg/weston work/rootfs/tmp
-          sudo chmod 1777 work/rootfs/tmp
-          sudo tee work/rootfs/etc/xdg/weston/weston.ini > /dev/null << 'EOF'
+          sudo mkdir -p work/rootfs/opt/wine work/rootfs/opt/dxvk work/rootfs/opt/game-engine
+
+          # 1. Fetch Kron4ek Wine-Builds Vanilla/Staging amd64 (with WoW64 & winewayland.drv support)
+          WINE_URL=$(curl -s https://api.github.com/repos/Kron4ek/Wine-Builds/releases | grep -o 'https://github.com/Kron4ek/Wine-Builds/releases/download/[^"]*amd64-wow64\.tar\.xz' | head -n 1)
+          if [ -z "$WINE_URL" ]; then
+            WINE_URL=$(curl -s https://api.github.com/repos/Kron4ek/Wine-Builds/releases | grep -o 'https://github.com/Kron4ek/Wine-Builds/releases/download/[^"]*amd64\.tar\.xz' | head -n 1)
+          fi
+          echo "Downloading Wine package: $WINE_URL"
+          wget -q "$WINE_URL" -O work/wine.tar.xz
+          sudo tar -xJf work/wine.tar.xz --strip-components=1 -C work/rootfs/opt/wine
+          rm -f work/wine.tar.xz
+
+          # 2. Fetch latest DXVK release (DirectX 9/10/11 to Vulkan translation for all SoCs)
+          DXVK_URL=$(curl -s https://api.github.com/repos/doitsujin/dxvk/releases/latest | grep -o 'https://github.com/doitsujin/dxvk/releases/download/[^"]*dxvk-[0-9.]*\.tar\.gz' | head -n 1)
+          if [ -n "$DXVK_URL" ]; then
+            echo "Downloading DXVK package: $DXVK_URL"
+            wget -q "$DXVK_URL" -O work/dxvk.tar.gz
+            sudo tar -xzf work/dxvk.tar.gz --strip-components=1 -C work/rootfs/opt/dxvk
+            rm -f work/dxvk.tar.gz
+          fi
+
+      - name: Install Direct Game Engine Launcher & Multi-SoC Profiles
+        run: |
+          sudo mkdir -p work/rootfs/etc/xdg/weston work/rootfs/etc/xdg/foot work/rootfs/root work/rootfs/games
+
+          # Foot config for debug console
+          sudo tee work/rootfs/etc/xdg/foot/foot.ini > /dev/null << 'EOF'
+          [main]
+          shell=/bin/bash
+          term=xterm-256color
+          font=monospace:size=11
+          pad=8x8
+
+          [csd]
+          preferred=client
+          size=24
+          EOF
+
+          # Kiosk Weston config (zero desktop bar, fullscreen Xwayland/Wayland game output)
+          sudo tee work/rootfs/etc/xdg/weston/weston-kiosk.ini > /dev/null << 'EOF'
           [core]
           backend=wayland-backend.so
-          shell=desktop-shell.so
+          shell=kiosk-shell.so
           use-pixman=true
           require-input=false
           idle-time=0
-
-          [shell]
-          locking=false
-          animation=none
-          panel-position=top
-          background-color=0xff16202c
-
-          [launcher]
-          icon=/usr/share/weston/icon_terminal.png
-          path=/usr/bin/foot
+          xwayland=true
           EOF
 
+          # Create Universal Game Engine Runner (/usr/local/bin/game-runner)
+          sudo tee work/rootfs/usr/local/bin/game-runner > /dev/null << 'EOF'
+          #!/bin/bash
+          set -e
+
+          export HOME="${HOME:-/root}"
+          export WINEPREFIX="${WINEPREFIX:-$HOME/.wine}"
+          export WINEARCH="win64"
+          export WINEDEBUG="${WINEDEBUG:--all}"
+          export BOX64_PATH="/opt/wine/bin:/usr/local/bin:/usr/bin:/bin"
+          export BOX64_LD_LIBRARY_PATH="/opt/wine/lib/wine/x86_64-unix:/opt/wine/lib64/wine/x86_64-unix:/usr/lib/x86_64-linux-gnu:/lib64:/usr/lib/aarch64-linux-gnu"
+          export BOX64_LOG="${BOX64_LOG:-0}"
+          export BOX64_NOBANNER=1
+
+          BOX64_BIN="/usr/local/bin/box64"
+          if [ ! -x "$BOX64_BIN" ]; then
+            BOX64_BIN="/usr/bin/box64"
+          fi
+
+          WINE_BIN="/opt/wine/bin/wine64"
+          if [ ! -x "$WINE_BIN" ]; then
+            WINE_BIN="/opt/wine/bin/wine"
+          fi
+
+          echo "[ENGINE] SoC GPU Backend : ${ND_GPU_BACKEND:-auto}"
+          echo "[ENGINE] DX Wrapper      : ${ND_DX_WRAPPER:-dxvk}"
+          echo "[ENGINE] Dynarec Preset  : ${ND_DYNAREC_PRESET:-performance}"
+          echo "[ENGINE] Render Res      : ${ND_RESOLUTION:-1280x720}"
+          echo "[ENGINE] Display Mode    : ${ND_DISPLAY_MODE:-wayland_direct}"
+
+          # Multi-SoC Vulkan & Mesa tuning (Snapdragon Adreno + MediaTek Mali/Immortalis + Exynos Xclipse)
+          export MESA_GL_VERSION_OVERRIDE=4.6
+          export MESA_GLSL_VERSION_OVERRIDE=460
+          export MESA_NO_ERROR=1
+          export PAN_MESA_DEBUG=gofaster,gl3
+
+          case "${ND_GPU_BACKEND:-auto}" in
+            adreno_turnip)
+              if [ -f /usr/share/vulkan/icd.d/freedreno_icd.aarch64.json ]; then
+                export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/freedreno_icd.aarch64.json
+              fi
+              export TU_DEBUG=noconform
+              ;;
+            mali_universal)
+              # Universal Vulkan/Mesa path for MediaTek Dimensity (Mali/Immortalis) & Exynos
+              export DXVK_CONFIG="d3d11.relaxedBarriers = True; d3d9.floatEmulation = True; dxvk.enableAsync = True"
+              if [ -e /dev/mali0 ] && [ -f /usr/share/vulkan/icd.d/panfrost_icd.aarch64.json ]; then
+                export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/panfrost_icd.aarch64.json:/usr/share/vulkan/icd.d/lvp_icd.aarch64.json
+              elif [ -f /usr/share/vulkan/icd.d/lvp_icd.aarch64.json ]; then
+                export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.aarch64.json
+              fi
+              ;;
+            software_lvp)
+              if [ -f /usr/share/vulkan/icd.d/lvp_icd.aarch64.json ]; then
+                export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.aarch64.json
+              fi
+              ;;
+            *)
+              if [ -e /dev/kgsl-3d0 ] && [ -f /usr/share/vulkan/icd.d/freedreno_icd.aarch64.json ]; then
+                export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/freedreno_icd.aarch64.json:/usr/share/vulkan/icd.d/lvp_icd.aarch64.json
+                export TU_DEBUG=noconform
+              elif [ -f /usr/share/vulkan/icd.d/lvp_icd.aarch64.json ]; then
+                export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.aarch64.json
+                export DXVK_CONFIG="d3d11.relaxedBarriers = True; d3d9.floatEmulation = True; dxvk.enableAsync = True"
+              fi
+              ;;
+          esac
+
+          # Initialize Wine Prefix & Drive Mappings on first run
+          if [ ! -d "$WINEPREFIX/drive_c" ]; then
+            echo "[ENGINE] Menginisialisasi Wine Prefix baru di $WINEPREFIX..."
+            mkdir -p "$WINEPREFIX/dosdevices"
+            "$BOX64_BIN" "$WINE_BIN" wineboot --init || true
+            ln -sfn "/storage/emulated/0/Download" "$WINEPREFIX/dosdevices/d:" 2>/dev/null || true
+            ln -sfn "/games" "$WINEPREFIX/dosdevices/e:" 2>/dev/null || true
+          fi
+
+          # Configure Wine Native Wayland Driver when in wayland_direct mode
+          if [ "${ND_DISPLAY_MODE:-wayland_direct}" = "wayland_direct" ]; then
+            unset DISPLAY
+            "$BOX64_BIN" "$WINE_BIN" reg add "HKCU\\Software\\Wine\\Drivers" /v Graphics /t REG_SZ /d wayland /f >/dev/null 2>&1 || true
+          fi
+
+          # Install DXVK DLLs if selected and available
+          if [ "${ND_DX_WRAPPER:-dxvk}" = "dxvk" ] && [ -d /opt/dxvk/x64 ]; then
+            if [ ! -f "$WINEPREFIX/.dxvk_installed" ]; then
+              echo "[ENGINE] Memasang modul DXVK (DirectX 9/10/11 -> Vulkan)..."
+              cp -f /opt/dxvk/x64/*.dll "$WINEPREFIX/drive_c/windows/system32/" 2>/dev/null || true
+              if [ -d "$WINEPREFIX/drive_c/windows/syswow64" ] && [ -d /opt/dxvk/x32 ]; then
+                cp -f /opt/dxvk/x32/*.dll "$WINEPREFIX/drive_c/windows/syswow64/" 2>/dev/null || true
+              fi
+              touch "$WINEPREFIX/.dxvk_installed"
+            fi
+            export WINEDLLOVERRIDES="d3d11,d3d10core,d3d9,dxgi=n,b"
+          else
+            export WINEDLLOVERRIDES="d3d11,d3d10core,d3d9,dxgi=b"
+          fi
+
+          TARGET_CMD="${1:-winecfg}"
+          shift || true
+
+          echo "[ENGINE] Menjalankan target: $TARGET_CMD $*"
+          if [ "${ND_DISPLAY_MODE:-wayland_direct}" = "kiosk_xwayland" ] && [ -x /usr/bin/weston ]; then
+            /usr/bin/weston --backend=wayland-backend.so --use-pixman --fullscreen --config=/etc/xdg/weston/weston-kiosk.ini &
+            sleep 1
+            export DISPLAY=:0
+          fi
+
+          exec "$BOX64_BIN" "$WINE_BIN" "$TARGET_CMD" "$@"
+          EOF
+          sudo chmod 0755 work/rootfs/usr/local/bin/game-runner
+
       - name: Unmount Pseudo-Filesystems & Clean Up Rootfs
+        if: always()
         run: |
           sudo umount -lf work/rootfs/sys || true
           sudo umount -lf work/rootfs/proc || true
@@ -99,7 +288,7 @@ jobs:
           sudo umount -lf work/rootfs/dev || true
           sudo rm -f work/rootfs/etc/resolv.conf
 
-      - name: Package Prebuilt Rootfs
+      - name: Package Prebuilt Game Engine Rootfs
         run: |
           cd work/rootfs
           sudo tar --hard-dereference \
@@ -110,12 +299,14 @@ jobs:
           cd ../..
           ls -lh work/nativedesktop-ubuntu-arm64.tar.gz
 
-      - name: Create GitHub Release & Upload Asset
+      - name: Create or Update GitHub Release Asset
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.0-rootfs
-          name: "Prebuilt Ubuntu 24.04 ARM64 Desktop"
-          body: "Prebuilt minimal Ubuntu 24.04 ARM64 root filesystem with Weston Wayland desktop, XKB keymaps, Fontconfig, and Foot terminal ready for NativeDesktop."
+          tag_name: v2.0.0-rootfs
+          name: "Windows Game Engine Rootfs (ARM64 + Box64 + Wine Wayland + DXVK)"
+          body: "Prebuilt Ubuntu 24.04 ARM64 Windows Game Engine rootfs featuring Box64 (Universal ARM64 for MediaTek Dimensity/Mali, Exynos, and Snapdragon), Wine WoW64 with Native Wayland driver, DXVK, and Multi-SoC Mesa Vulkan drivers."
           draft: false
           prerelease: false
           files: work/nativedesktop-ubuntu-arm64.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

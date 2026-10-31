@@ -29,6 +29,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -45,8 +46,10 @@ import com.core.desktop.R
 import com.core.desktop.data.model.DesktopEngineState
 import com.core.desktop.ui.components.ConfigCard
 import com.core.desktop.ui.components.DesktopSurfaceView
+import com.core.desktop.ui.components.GameTelemetryHud
 import com.core.desktop.ui.components.LogViewerCard
 import com.core.desktop.ui.components.StatusIndicator
+import com.core.desktop.ui.components.VirtualGamepadOverlay
 import com.core.desktop.ui.theme.DesktopColors
 import com.core.desktop.ui.theme.DesktopDimens
 import com.core.desktop.ui.theme.DesktopTypography
@@ -57,14 +60,19 @@ fun DesktopScreen(
     viewModel: DesktopViewModel,
     modifier: Modifier = Modifier
 ) {
+    val hardwareInfo by viewModel.hardwareInfo.collectAsState()
     val engineState by viewModel.engineState.collectAsState()
     val config by viewModel.config.collectAsState()
+    val perfMetrics by viewModel.perfMetrics.collectAsState()
     val errorMessage by viewModel.lastErrorMessage.collectAsState()
     val extractedBytes by viewModel.extractedBytes.collectAsState()
     val logs by viewModel.logs.collectAsState()
 
     var showLiveLogs by remember { mutableStateOf(false) }
+    var showVirtualGamepad by remember { mutableStateOf(true) }
     var keyboardToggleCount by remember { mutableIntStateOf(0) }
+    var lastPointerNormX by remember { mutableFloatStateOf(0.5f) }
+    var lastPointerNormY by remember { mutableFloatStateOf(0.5f) }
 
     val view = LocalView.current
     val isRunning = engineState is DesktopEngineState.Running
@@ -98,11 +106,19 @@ fun DesktopScreen(
         }
     }
 
-    val filePickerLauncher = rememberLauncherForActivityResult(
+    val rootfsPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
         if (uri != null) {
             viewModel.extractRootfsArchive(uri)
+        }
+    }
+
+    val gameExePickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            viewModel.importGameFile(uri)
         }
     }
 
@@ -123,16 +139,43 @@ fun DesktopScreen(
             .background(backgroundGradient)
     ) {
         if (isRunning) {
-            // Live Linux Desktop View
+            // Fullscreen Windows Game Surface
             DesktopSurfaceView(
                 onSurfaceCreated = viewModel::onSurfaceCreated,
                 onSurfaceDestroyed = viewModel::onSurfaceDestroyed,
-                onPointerEvent = viewModel::onPointerEvent,
+                onPointerEvent = { action, normX, normY ->
+                    lastPointerNormX = normX
+                    lastPointerNormY = normY
+                    viewModel.onPointerEvent(action, normX, normY)
+                },
                 onKeyEvent = viewModel::onKeyEvent,
                 keyboardToggleCount = keyboardToggleCount
             )
 
-            // Bottom-aligned overlay controls so Weston top panel (launcher + clock) is unobstructed
+            // Real-Time FPS & Frame-Time Telemetry HUD
+            GameTelemetryHud(
+                metrics = perfMetrics,
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(DesktopDimens.SpaceLarge)
+            )
+
+            // Virtual Gamepad Overlay (WASD, Shift, Esc, Space, Enter, E, R, L-Click, R-Click)
+            if (showVirtualGamepad) {
+                VirtualGamepadOverlay(
+                    onKeyEvent = viewModel::onKeyEvent,
+                    onMouseButtonEvent = { isRight, pressed ->
+                        val action = if (isRight) {
+                            if (pressed) 3 else 4
+                        } else {
+                            if (pressed) 0 else 1
+                        }
+                        viewModel.onPointerEvent(action, lastPointerNormX, lastPointerNormY)
+                    }
+                )
+            }
+
+            // Bottom-aligned control bar
             Column(
                 modifier = Modifier
                     .align(Alignment.BottomEnd)
@@ -150,6 +193,22 @@ fun DesktopScreen(
                     horizontalArrangement = Arrangement.End
                 ) {
                     Button(
+                        onClick = { showVirtualGamepad = !showVirtualGamepad },
+                        shape = RoundedCornerShape(DesktopDimens.ButtonCornerRadius),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (showVirtualGamepad) DesktopColors.Accent else DesktopColors.SurfaceInteractive,
+                            contentColor = DesktopColors.TextPrimary
+                        )
+                    ) {
+                        Text(
+                            text = stringResource(R.string.btn_toggle_gamepad),
+                            style = DesktopTypography.labelLarge
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.width(DesktopDimens.SpaceSmall))
+
+                    Button(
                         onClick = { keyboardToggleCount++ },
                         shape = RoundedCornerShape(DesktopDimens.ButtonCornerRadius),
                         colors = ButtonDefaults.buttonColors(
@@ -163,7 +222,7 @@ fun DesktopScreen(
                         )
                     }
 
-                    Spacer(modifier = Modifier.width(DesktopDimens.SpaceMedium))
+                    Spacer(modifier = Modifier.width(DesktopDimens.SpaceSmall))
 
                     Button(
                         onClick = { showLiveLogs = !showLiveLogs },
@@ -181,7 +240,7 @@ fun DesktopScreen(
                         )
                     }
 
-                    Spacer(modifier = Modifier.width(DesktopDimens.SpaceMedium))
+                    Spacer(modifier = Modifier.width(DesktopDimens.SpaceSmall))
 
                     Button(
                         onClick = viewModel::stopSession,
@@ -199,7 +258,7 @@ fun DesktopScreen(
                 }
             }
         } else {
-            // Configuration & Status Screen
+            // Game Engine Configuration & Launcher Screen
             Column(
                 modifier = Modifier
                     .fillMaxSize()
@@ -219,24 +278,43 @@ fun DesktopScreen(
                     errorMessage = errorMessage
                 )
 
-                Spacer(modifier = Modifier.height(DesktopDimens.SpaceDoubleLarge))
+                Spacer(modifier = Modifier.height(DesktopDimens.SpaceExtraLarge))
 
                 ConfigCard(
+                    hardwareInfo = hardwareInfo,
                     config = config,
                     isStarting = engineState is DesktopEngineState.Starting,
                     isExtracting = engineState is DesktopEngineState.Extracting,
                     extractedBytes = extractedBytes,
                     onRootfsChange = viewModel::updateRootfsPath,
-                    onExecutableChange = viewModel::updateExecutablePath,
+                    onGameTargetChange = viewModel::updateGameTarget,
                     onArgsChange = viewModel::updateSessionArgs,
+                    onGpuBackendChange = viewModel::updateGpuBackend,
+                    onDxWrapperChange = viewModel::updateDxWrapper,
+                    onDynarecPresetChange = viewModel::updateDynarecPreset,
+                    onResolutionChange = viewModel::updateRenderResolution,
+                    onDisplayModeChange = viewModel::updateDisplayMode,
+                    onEsyncChange = viewModel::updateEnableEsync,
+                    onPerfCoresChange = viewModel::updateLockPerformanceCores,
                     onStartClick = viewModel::startSession,
                     onResetClick = viewModel::resetToDefaults,
                     onSelectArchiveClick = {
-                        filePickerLauncher.launch(
+                        rootfsPickerLauncher.launch(
                             arrayOf(
                                 "application/gzip",
                                 "application/x-gzip",
                                 "application/x-tar",
+                                "application/octet-stream",
+                                "*/*"
+                            )
+                        )
+                    },
+                    onSelectGameExeClick = {
+                        gameExePickerLauncher.launch(
+                            arrayOf(
+                                "application/x-msdownload",
+                                "application/x-dosexec",
+                                "application/vnd.microsoft.portable-executable",
                                 "application/octet-stream",
                                 "*/*"
                             )
@@ -251,5 +329,3 @@ fun DesktopScreen(
         }
     }
 }
-
-

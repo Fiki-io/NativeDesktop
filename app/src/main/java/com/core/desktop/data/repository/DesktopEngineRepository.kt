@@ -3,9 +3,13 @@ package com.core.desktop.data.repository
 import android.content.Context
 import android.net.Uri
 import android.os.Build
+import android.provider.OpenableColumns
 import android.view.Surface
 import com.core.desktop.R
 import com.core.desktop.data.model.DesktopSessionConfig
+import com.core.desktop.data.model.GpuBackend
+import com.core.desktop.data.model.PerfMetrics
+import com.core.desktop.data.model.SoCHardwareInfo
 import com.core.desktop.util.TarExtractor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -20,6 +24,67 @@ class DesktopEngineRepository(private val context: Context) {
 
     init {
         System.loadLibrary("desktop_engine")
+    }
+
+    fun detectHardwareInfo(): SoCHardwareInfo {
+        val socMan = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            Build.SOC_MANUFACTURER.takeIf { it.isNotBlank() && it != Build.UNKNOWN } ?: ""
+        } else {
+            ""
+        }
+        val socMod = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            Build.SOC_MODEL.takeIf { it.isNotBlank() && it != Build.UNKNOWN } ?: ""
+        } else {
+            ""
+        }
+        val hw = Build.HARDWARE ?: ""
+        val board = Build.BOARD ?: ""
+        val socName = listOf(socMan, socMod).filter { it.isNotBlank() }.joinToString(" ")
+            .ifBlank { "$hw ($board)" }
+
+        val hasKgsl = File("/dev/kgsl-3d0").exists()
+        val hasMali = File("/dev/mali0").exists()
+        val hasDrm = File("/dev/dri/renderD128").exists()
+
+        val (gpuNode, recommendedBackend) = when {
+            hasMali -> "Mali / Immortalis (/dev/mali0)" to GpuBackend.MALI_UNIVERSAL
+            hasKgsl -> "Adreno KGSL (/dev/kgsl-3d0)" to GpuBackend.ADRENO_TURNIP
+            hasDrm -> "DRM RenderNode (/dev/dri/renderD128)" to GpuBackend.MALI_UNIVERSAL
+            else -> "Vulkan WSI Universal" to GpuBackend.AUTO
+        }
+
+        val freqsKhz = mutableListOf<Long>()
+        for (i in 0 until 16) {
+            val freqFile = File("/sys/devices/system/cpu/cpu$i/cpufreq/cpuinfo_max_freq")
+            if (freqFile.exists()) {
+                val khz = freqFile.readText().trim().toLongOrNull()
+                if (khz != null && khz > 0L) {
+                    freqsKhz.add(khz)
+                }
+            }
+        }
+
+        val cpuTopology = if (freqsKhz.isNotEmpty()) {
+            val minKhz = freqsKhz.minOrNull() ?: 0L
+            val maxKhz = freqsKhz.maxOrNull() ?: 0L
+            val perfCores = freqsKhz.count { it > minKhz }.let { if (it == 0) freqsKhz.size else it }
+            val effCores = freqsKhz.size - perfCores
+            val maxMhz = maxKhz / 1000L
+            if (effCores > 0) {
+                "${freqsKhz.size} Cores ($perfCores Perf + $effCores Eff, Max ${maxMhz} MHz)"
+            } else {
+                "${freqsKhz.size} Cores (Max ${maxMhz} MHz)"
+            }
+        } else {
+            "${Runtime.getRuntime().availableProcessors()} Cores ARM64"
+        }
+
+        return SoCHardwareInfo(
+            socName = socName,
+            gpuDriverNode = gpuNode,
+            cpuTopology = cpuTopology,
+            recommendedBackend = recommendedBackend
+        )
     }
 
     private fun prepareShimLibrary(): File {
@@ -44,7 +109,6 @@ class DesktopEngineRepository(private val context: Context) {
             }
         }
 
-        // Fallback: extract libdesktop_shim.so directly from the APK archive if not unpacked
         val apkPath = context.applicationInfo.sourceDir
         if (!apkPath.isNullOrEmpty()) {
             try {
@@ -73,6 +137,52 @@ class DesktopEngineRepository(private val context: Context) {
         return dstShim
     }
 
+    suspend fun importGameFileFromUri(uri: Uri): Result<String> = withContext(Dispatchers.IO) {
+        try {
+            val rootfsDir = File(context.filesDir, "rootfs")
+            val gamesDir = File(rootfsDir, "games")
+            if (!gamesDir.exists()) {
+                gamesDir.mkdirs()
+            }
+
+            var displayName = "game_exec.exe"
+            context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (nameIndex >= 0 && cursor.moveToFirst()) {
+                    val name = cursor.getString(nameIndex)
+                    if (!name.isNullOrBlank()) {
+                        displayName = name.replace(Regex("[^a-zA-Z0-9._-]"), "_")
+                    }
+                }
+            }
+
+            val dstFile = File(gamesDir, displayName)
+            val input = context.contentResolver.openInputStream(uri)
+                ?: return@withContext Result.failure(
+                    java.io.IOException(context.getString(R.string.error_game_file_open_failed))
+                )
+
+            input.use { inStream ->
+                FileOutputStream(dstFile).use { outStream ->
+                    inStream.copyTo(outStream)
+                }
+            }
+
+            if (!dstFile.exists() || dstFile.length() <= 0L) {
+                return@withContext Result.failure(
+                    java.io.IOException(context.getString(R.string.error_game_file_empty))
+                )
+            }
+
+            dstFile.setReadable(true, false)
+            dstFile.setExecutable(true, false)
+
+            Result.success("/games/${dstFile.name}")
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
     suspend fun startSession(
         config: DesktopSessionConfig,
         surface: Surface?
@@ -81,25 +191,6 @@ class DesktopEngineRepository(private val context: Context) {
         if (!rootfsDir.exists() || !rootfsDir.isDirectory) {
             return@withContext Result.failure(
                 IllegalArgumentException(context.getString(R.string.error_rootfs_not_found))
-            )
-        }
-
-        val requestedExec = if (config.executablePath == "/bin/sh" && config.sessionArgs.isEmpty()) {
-            val westonCandidate = File(rootfsDir, "usr/bin/weston")
-            if (westonCandidate.exists()) "/usr/bin/weston" else config.executablePath
-        } else {
-            config.executablePath
-        }
-
-        val targetExec = if (requestedExec.startsWith("/")) {
-            File(rootfsDir, requestedExec.substring(1))
-        } else {
-            File(rootfsDir, requestedExec)
-        }
-
-        if (!targetExec.exists()) {
-            return@withContext Result.failure(
-                IllegalArgumentException(context.getString(R.string.error_executable_not_found))
             )
         }
 
@@ -114,6 +205,8 @@ class DesktopEngineRepository(private val context: Context) {
         socketDir.setWritable(true, true)
         socketDir.setExecutable(true, true)
 
+        nativeSetResolution(config.renderResolution.width, config.renderResolution.height)
+
         val waylandInitOk = nativeInit(socketDir.absolutePath, "wayland-0")
         if (!waylandInitOk) {
             return@withContext Result.failure(
@@ -125,15 +218,31 @@ class DesktopEngineRepository(private val context: Context) {
             nativeSetSurface(surface)
         }
 
-        val envList = config.envVars.map { "${it.key}=${it.value}" }.toTypedArray()
-        val argsArray = config.sessionArgs.toTypedArray()
+        val runnerFile = File(rootfsDir, "usr/local/bin/game-runner")
+        val bashFile = File(rootfsDir, "bin/bash")
+        val shFile = File(rootfsDir, "bin/sh")
+        if (!bashFile.exists() && !shFile.exists()) {
+            nativeStopSession()
+            return@withContext Result.failure(
+                IllegalArgumentException(context.getString(R.string.error_executable_not_found))
+            )
+        }
+
+        val envMap = config.buildEngineEnvironment()
+        val envList = envMap.map { "${it.key}=${it.value}" }.toTypedArray()
+
+        val fullArgs = mutableListOf<String>()
+        if (config.gameTarget.isNotBlank()) {
+            fullArgs.add(config.gameTarget)
+        }
+        fullArgs.addAll(config.sessionArgs)
 
         val processStarted = nativeStartSession(
             rootfsPath = rootfsDir.absolutePath,
             shimPath = shimPath,
             socketDir = socketDir.absolutePath,
-            execPath = targetExec.absolutePath,
-            args = argsArray,
+            execPath = runnerFile.absolutePath,
+            args = fullArgs.toTypedArray(),
             envVars = envList
         )
 
@@ -159,6 +268,19 @@ class DesktopEngineRepository(private val context: Context) {
         nativeInjectKey(linuxKeycode, pressed, shiftMod)
     }
 
+    fun getPerfMetrics(): PerfMetrics {
+        val raw = nativeGetPerfMetrics()
+        if (raw.size >= 4) {
+            return PerfMetrics(
+                fps = raw[0],
+                frameTimeMs = raw[1],
+                renderWidth = raw[2].toInt(),
+                renderHeight = raw[3].toInt()
+            )
+        }
+        return PerfMetrics()
+    }
+
     var processTerminatedListener: ((exitCode: Int, message: String) -> Unit)? = null
 
     fun onNativeProcessTerminated(exitCode: Int, message: String) {
@@ -178,14 +300,13 @@ class DesktopEngineRepository(private val context: Context) {
     }
 
     fun getDefaultExecutablePath(): String {
-        val rootfsDir = File(context.filesDir, "rootfs")
-        val westonBin = File(rootfsDir, "usr/bin/weston")
-        return if (westonBin.exists()) "/usr/bin/weston" else "/bin/sh"
+        return "/usr/local/bin/game-runner"
     }
 
     fun isRootfsInstalled(): Boolean {
         val rootfsDir = File(context.filesDir, "rootfs")
-        return rootfsDir.exists() && rootfsDir.isDirectory && (File(rootfsDir, "bin").exists() || File(rootfsDir, "usr").exists())
+        return rootfsDir.exists() && rootfsDir.isDirectory &&
+            (File(rootfsDir, "bin").exists() || File(rootfsDir, "usr").exists())
     }
 
     suspend fun extractRootfsFromUri(
@@ -222,7 +343,6 @@ class DesktopEngineRepository(private val context: Context) {
                 TarExtractor.extract(stream, rootfsDir, onProgress)
             }
 
-            // Post-extraction: ensure permissions on all binaries and dirs
             rootfsDir.walkTopDown().forEach { f ->
                 if (f.isDirectory) {
                     f.setReadable(true, false)
@@ -241,6 +361,8 @@ class DesktopEngineRepository(private val context: Context) {
         }
     }
 
+    private external fun nativeSetResolution(width: Int, height: Int)
+    private external fun nativeGetPerfMetrics(): FloatArray
     private external fun nativeInit(socketDir: String, socketName: String): Boolean
     private external fun nativeSetSurface(surface: Surface?)
     private external fun nativeInjectPointer(action: Int, normX: Float, normY: Float)

@@ -453,10 +453,16 @@ void desktop_shim_rewrite_path(const char *in_path, char *out_path, size_t max_l
         return;
     }
 
-    // Do not rewrite Android app/host paths (/data/user/, /data/data/, /data/app/, /system/, /apex/)
+    // Do not rewrite Android app/host paths, external storage, or vendor GPU driver paths
     if (shim_strncmp(in_path, "/data/user/", 11) == 0 ||
         shim_strncmp(in_path, "/data/data/", 11) == 0 ||
         shim_strncmp(in_path, "/data/app/", 10) == 0 ||
+        shim_strncmp(in_path, "/storage/", 9) == 0 ||
+        shim_strncmp(in_path, "/sdcard/", 8) == 0 ||
+        shim_strncmp(in_path, "/sdcard", 8) == 0 ||
+        shim_strncmp(in_path, "/mnt/", 5) == 0 ||
+        shim_strncmp(in_path, "/vendor/", 8) == 0 ||
+        shim_strncmp(in_path, "/odm/", 5) == 0 ||
         shim_strncmp(in_path, "/system/", 8) == 0 ||
         shim_strncmp(in_path, "/apex/", 6) == 0) {
         shim_strncpy(out_path, in_path, max_len);
@@ -869,15 +875,30 @@ int shm_unlink(const char *name) {
     return (int)set_errno_return(raw_syscall3(__NR_unlinkat, AT_FDCWD, (long)tmp_path, 0));
 }
 
-static int is_elf_binary(const char *path) {
+#define BIN_TYPE_NONE      0
+#define BIN_TYPE_ARM64_ELF 1
+#define BIN_TYPE_X86_ELF   2
+#define BIN_TYPE_PE_EXE    3
+
+static int detect_binary_type(const char *path) {
     long fd = raw_syscall4(__NR_openat, AT_FDCWD, (long)path, O_RDONLY | O_CLOEXEC, 0);
     if (fd < 0) {
-        return 0;
+        return BIN_TYPE_NONE;
     }
-    char magic[4];
-    long n = raw_syscall3(__NR_read, fd, (long)magic, 4);
+    unsigned char hdr[20];
+    long n = raw_syscall3(__NR_read, fd, (long)hdr, sizeof(hdr));
     raw_syscall1(__NR_close, fd);
-    return (n == 4 && magic[0] == 0x7f && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F');
+    if (n >= 2 && hdr[0] == 'M' && hdr[1] == 'Z') {
+        return BIN_TYPE_PE_EXE;
+    }
+    if (n >= 20 && hdr[0] == 0x7f && hdr[1] == 'E' && hdr[2] == 'L' && hdr[3] == 'F') {
+        uint16_t machine = (uint16_t)hdr[18] | ((uint16_t)hdr[19] << 8);
+        if (machine == 62 || machine == 3) { // EM_X86_64 (62) or EM_386 (3)
+            return BIN_TYPE_X86_ELF;
+        }
+        return BIN_TYPE_ARM64_ELF;
+    }
+    return BIN_TYPE_NONE;
 }
 
 static int is_shebang_script(const char *path, char *out_interp, size_t max_interp_len) {
@@ -932,16 +953,51 @@ static void find_dynamic_linker(const char *rootfs, char *out_ld, size_t max_len
     shim_concat2(out_ld, max_len, rootfs, "/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1");
 }
 
+static int find_box64_binary(const char *rootfs, char *out_box64, size_t max_len) {
+    const char *candidates[] = {
+        "/usr/local/bin/box64",
+        "/usr/bin/box64",
+        "/bin/box64"
+    };
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
+        shim_concat2(out_box64, max_len, rootfs, candidates[i]);
+        if (raw_syscall4(__NR_faccessat, AT_FDCWD, (long)out_box64, X_OK, 0) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int find_wine64_binary(const char *rootfs, char *out_wine, size_t max_len) {
+    const char *candidates[] = {
+        "/opt/wine/bin/wine64",
+        "/opt/wine/bin/wine",
+        "/usr/local/bin/wine64",
+        "/usr/bin/wine64",
+        "/usr/bin/wine"
+    };
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
+        shim_concat2(out_wine, max_len, rootfs, candidates[i]);
+        if (raw_syscall4(__NR_faccessat, AT_FDCWD, (long)out_wine, X_OK, 0) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static void build_library_path(const char *rootfs, char *out_lib_path, size_t max_len) {
     const char *subdirs[] = {
         "/usr/lib/aarch64-linux-gnu",
         "/lib/aarch64-linux-gnu",
+        "/usr/local/lib",
         "/usr/lib",
         "/lib",
         "/usr/lib/aarch64-linux-gnu/libweston-13",
         "/usr/lib/aarch64-linux-gnu/libweston-12",
         "/usr/lib/aarch64-linux-gnu/libweston-10",
         "/usr/lib/aarch64-linux-gnu/weston",
+        "/opt/wine/lib",
+        "/opt/wine/lib64",
         "/usr/lib/x86_64-linux-gnu",
         "/lib64"
     };
@@ -982,25 +1038,64 @@ int execve(const char *pathname, char *const argv[], char *const envp[]) {
 
     char interp[PATH_MAX];
     int is_script = is_shebang_script(resolved, interp, sizeof(interp));
+    int bin_type = BIN_TYPE_ARM64_ELF;
     if (is_script) {
         desktop_shim_rewrite_path(interp, target_binary, sizeof(target_binary));
-    } else if (!is_elf_binary(resolved)) {
-        return (int)set_errno_return(raw_syscall3(__NR_execve, (long)resolved, (long)argv, (long)envp));
+    } else {
+        bin_type = detect_binary_type(resolved);
+        if (bin_type == BIN_TYPE_NONE) {
+            return (int)set_errno_return(raw_syscall3(__NR_execve, (long)resolved, (long)argv, (long)envp));
+        }
     }
-
-    shim_patch_arm64_seccomp(target_binary);
 
     char lib_path[PATH_MAX * 2];
     build_library_path(s_rootfs, lib_path, sizeof(lib_path));
 
     int argc = 0;
     if (argv) {
-        while (argv[argc] != NULL && argc < 240) {
+        while (argv[argc] != NULL && argc < 236) {
             argc++;
         }
     }
 
+    char box64_path[PATH_MAX];
+    char wine_path[PATH_MAX];
     char *new_argv[256];
+
+    // Userspace binfmt_misc routing for x86_64 ELF (wineserver, wine64, wine-preloader) and PE .exe
+    if (!is_script && bin_type == BIN_TYPE_X86_ELF && find_box64_binary(s_rootfs, box64_path, sizeof(box64_path))) {
+        shim_patch_arm64_seccomp(box64_path);
+        new_argv[0] = ld_path;
+        new_argv[1] = "--library-path";
+        new_argv[2] = lib_path;
+        new_argv[3] = box64_path;
+        new_argv[4] = target_binary;
+        for (int i = 1; i < argc; ++i) {
+            new_argv[i + 4] = argv[i];
+        }
+        new_argv[argc + 4] = NULL;
+        return (int)set_errno_return(raw_syscall3(__NR_execve, (long)ld_path, (long)new_argv, (long)envp));
+    }
+
+    if (!is_script && bin_type == BIN_TYPE_PE_EXE &&
+        find_box64_binary(s_rootfs, box64_path, sizeof(box64_path)) &&
+        find_wine64_binary(s_rootfs, wine_path, sizeof(wine_path))) {
+        shim_patch_arm64_seccomp(box64_path);
+        new_argv[0] = ld_path;
+        new_argv[1] = "--library-path";
+        new_argv[2] = lib_path;
+        new_argv[3] = box64_path;
+        new_argv[4] = wine_path;
+        new_argv[5] = target_binary;
+        for (int i = 1; i < argc; ++i) {
+            new_argv[i + 5] = argv[i];
+        }
+        new_argv[argc + 5] = NULL;
+        return (int)set_errno_return(raw_syscall3(__NR_execve, (long)ld_path, (long)new_argv, (long)envp));
+    }
+
+    shim_patch_arm64_seccomp(target_binary);
+
     new_argv[0] = ld_path;
     new_argv[1] = "--library-path";
     new_argv[2] = lib_path;

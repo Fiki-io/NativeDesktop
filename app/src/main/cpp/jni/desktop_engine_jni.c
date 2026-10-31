@@ -8,13 +8,17 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "../compositor/wayland_server.h"
@@ -36,12 +40,22 @@ static int s_stdin_pipe_fd = -1;
 static pthread_t s_log_thread;
 static bool s_log_thread_active = false;
 
+static int s_target_res_w = 1280;
+static int s_target_res_h = 720;
+
 // Cached last frame so frames rendered before SurfaceView creation are never lost
 static uint8_t *s_last_frame = NULL;
 static size_t s_last_frame_cap = 0;
 static int s_last_frame_w = 0;
 static int s_last_frame_h = 0;
 static int s_last_frame_stride = 0;
+
+// Real-time measured frame telemetry (from actual Wayland buffer commits)
+static uint64_t s_last_frame_ts_ns = 0;
+static uint64_t s_fps_window_start_ns = 0;
+static uint32_t s_fps_window_frames = 0;
+static float s_measured_fps = 0.0f;
+static float s_measured_frametime_ms = 0.0f;
 
 // Circular log buffer for UI inspection
 static char s_logs[MAX_LOG_LINES][LOG_LINE_LEN];
@@ -52,6 +66,12 @@ static pthread_mutex_t s_log_lock = PTHREAD_MUTEX_INITIALIZER;
 static JavaVM *s_jvm = NULL;
 static jobject s_repo_global_ref = NULL;
 static jmethodID s_term_callback_method = NULL;
+
+static uint64_t monotonic_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
 
 static void append_log_line(const char *line) {
     pthread_mutex_lock(&s_log_lock);
@@ -221,24 +241,40 @@ static void patch_directory_recursive(const char *dir_path, int depth) {
     closedir(dir);
 }
 
-static void write_weston_config(const char *rootfs) {
+static void write_engine_configs(const char *rootfs) {
     char root_home[PATH_MAX];
+    char games_dir[PATH_MAX];
+    char usr_dir[PATH_MAX];
+    char usr_local_dir[PATH_MAX];
+    char usr_local_bin_dir[PATH_MAX];
     char etc_dir[PATH_MAX];
     char xdg_dir[PATH_MAX];
     char weston_dir[PATH_MAX];
     char foot_dir[PATH_MAX];
     char ini_path[PATH_MAX];
+    char kiosk_ini_path[PATH_MAX];
     char foot_ini_path[PATH_MAX];
+    char runner_path[PATH_MAX];
 
     snprintf(root_home, sizeof(root_home), "%s/root", rootfs);
+    snprintf(games_dir, sizeof(games_dir), "%s/games", rootfs);
+    snprintf(usr_dir, sizeof(usr_dir), "%s/usr", rootfs);
+    snprintf(usr_local_dir, sizeof(usr_local_dir), "%s/usr/local", rootfs);
+    snprintf(usr_local_bin_dir, sizeof(usr_local_bin_dir), "%s/usr/local/bin", rootfs);
     snprintf(etc_dir, sizeof(etc_dir), "%s/etc", rootfs);
     snprintf(xdg_dir, sizeof(xdg_dir), "%s/etc/xdg", rootfs);
     snprintf(weston_dir, sizeof(weston_dir), "%s/etc/xdg/weston", rootfs);
     snprintf(foot_dir, sizeof(foot_dir), "%s/etc/xdg/foot", rootfs);
     snprintf(ini_path, sizeof(ini_path), "%s/etc/xdg/weston/weston.ini", rootfs);
+    snprintf(kiosk_ini_path, sizeof(kiosk_ini_path), "%s/etc/xdg/weston/weston-kiosk.ini", rootfs);
     snprintf(foot_ini_path, sizeof(foot_ini_path), "%s/etc/xdg/foot/foot.ini", rootfs);
+    snprintf(runner_path, sizeof(runner_path), "%s/usr/local/bin/game-runner", rootfs);
 
     mkdir(root_home, 0755);
+    mkdir(games_dir, 0755);
+    mkdir(usr_dir, 0755);
+    mkdir(usr_local_dir, 0755);
+    mkdir(usr_local_bin_dir, 0755);
     mkdir(etc_dir, 0755);
     mkdir(xdg_dir, 0755);
     mkdir(weston_dir, 0755);
@@ -254,9 +290,22 @@ static void write_weston_config(const char *rootfs) {
             "pad=8x8\n\n"
             "[csd]\n"
             "preferred=client\n"
-            "size=26\n"
+            "size=24\n"
         );
         fclose(ffp);
+    }
+
+    FILE *kfp = fopen(kiosk_ini_path, "w");
+    if (kfp) {
+        fprintf(kfp,
+            "[core]\n"
+            "backend=wayland-backend.so\n"
+            "shell=kiosk-shell.so\n"
+            "use-pixman=true\n"
+            "require-input=false\n"
+            "idle-time=0\n"
+        );
+        fclose(kfp);
     }
 
     FILE *fp = fopen(ini_path, "w");
@@ -272,7 +321,7 @@ static void write_weston_config(const char *rootfs) {
             "locking=false\n"
             "animation=none\n"
             "panel-position=top\n"
-            "background-color=0xff16202c\n\n"
+            "background-color=0xff121212\n\n"
             "[launcher]\n"
             "icon=%s/usr/share/weston/icon_terminal.png\n"
             "path=/usr/bin/foot -c %s/etc/xdg/foot/foot.ini -l error /bin/bash\n",
@@ -281,14 +330,127 @@ static void write_weston_config(const char *rootfs) {
         );
         fclose(fp);
     }
+
+    FILE *rfp = fopen(runner_path, "w");
+    if (rfp) {
+        fprintf(rfp,
+            "#!/bin/bash\n"
+            "export HOME=\"${HOME:-%s/root}\"\n"
+            "export WINEPREFIX=\"${WINEPREFIX:-$HOME/.wine}\"\n"
+            "export WINEARCH=\"win64\"\n"
+            "export WINEDEBUG=\"${WINEDEBUG:--all}\"\n"
+            "export BOX64_PATH=\"/opt/wine/bin:/usr/local/bin:/usr/bin:/bin\"\n"
+            "export BOX64_LD_LIBRARY_PATH=\"/opt/wine/lib/wine/x86_64-unix:/opt/wine/lib64/wine/x86_64-unix:/usr/lib/x86_64-linux-gnu:/lib64:/usr/lib/aarch64-linux-gnu\"\n"
+            "export BOX64_LOG=\"${BOX64_LOG:-0}\"\n"
+            "export BOX64_NOBANNER=1\n\n"
+            "echo \"[ENGINE] SoC GPU Backend : ${ND_GPU_BACKEND:-auto}\"\n"
+            "echo \"[ENGINE] DX Wrapper      : ${ND_DX_WRAPPER:-dxvk}\"\n"
+            "echo \"[ENGINE] Dynarec Preset  : ${ND_DYNAREC_PRESET:-performance}\"\n"
+            "echo \"[ENGINE] Render Res      : ${ND_RESOLUTION:-1280x720}\"\n"
+            "echo \"[ENGINE] Display Mode    : ${ND_DISPLAY_MODE:-wayland_direct}\"\n\n"
+            "export MESA_GL_VERSION_OVERRIDE=4.6\n"
+            "export MESA_GLSL_VERSION_OVERRIDE=460\n"
+            "export MESA_NO_ERROR=1\n"
+            "export PAN_MESA_DEBUG=gofaster,gl3\n\n"
+            "case \"${ND_GPU_BACKEND:-auto}\" in\n"
+            "  adreno_turnip)\n"
+            "    if [ -f /usr/share/vulkan/icd.d/freedreno_icd.aarch64.json ]; then\n"
+            "      export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/freedreno_icd.aarch64.json\n"
+            "    fi\n"
+            "    export TU_DEBUG=noconform\n"
+            "    ;;\n"
+            "  mali_universal)\n"
+            "    export DXVK_CONFIG=\"d3d11.relaxedBarriers = True; d3d9.floatEmulation = True; dxvk.enableAsync = True\"\n"
+            "    if [ -e /dev/mali0 ] && [ -f /usr/share/vulkan/icd.d/panfrost_icd.aarch64.json ]; then\n"
+            "      export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/panfrost_icd.aarch64.json:/usr/share/vulkan/icd.d/lvp_icd.aarch64.json\n"
+            "    elif [ -f /usr/share/vulkan/icd.d/lvp_icd.aarch64.json ]; then\n"
+            "      export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.aarch64.json\n"
+            "    fi\n"
+            "    ;;\n"
+            "  software_lvp)\n"
+            "    if [ -f /usr/share/vulkan/icd.d/lvp_icd.aarch64.json ]; then\n"
+            "      export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.aarch64.json\n"
+            "    fi\n"
+            "    ;;\n"
+            "  *)\n"
+            "    if [ -e /dev/kgsl-3d0 ] && [ -f /usr/share/vulkan/icd.d/freedreno_icd.aarch64.json ]; then\n"
+            "      export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/freedreno_icd.aarch64.json:/usr/share/vulkan/icd.d/lvp_icd.aarch64.json\n"
+            "      export TU_DEBUG=noconform\n"
+            "    elif [ -f /usr/share/vulkan/icd.d/lvp_icd.aarch64.json ]; then\n"
+            "      export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.aarch64.json\n"
+            "      export DXVK_CONFIG=\"d3d11.relaxedBarriers = True; d3d9.floatEmulation = True; dxvk.enableAsync = True\"\n"
+            "    fi\n"
+            "    ;;\n"
+            "esac\n\n"
+            "BOX64_BIN=\"\"\n"
+            "if [ -x /usr/local/bin/box64 ]; then BOX64_BIN=\"/usr/local/bin/box64\";\n"
+            "elif [ -x /usr/bin/box64 ]; then BOX64_BIN=\"/usr/bin/box64\"; fi\n\n"
+            "WINE_BIN=\"\"\n"
+            "if [ -x /opt/wine/bin/wine64 ]; then WINE_BIN=\"/opt/wine/bin/wine64\";\n"
+            "elif [ -x /opt/wine/bin/wine ]; then WINE_BIN=\"/opt/wine/bin/wine\";\n"
+            "elif [ -x /usr/bin/wine64 ]; then WINE_BIN=\"/usr/bin/wine64\"; fi\n\n"
+            "TARGET_CMD=\"${1:-winecfg}\"\n"
+            "shift || true\n\n"
+            "if [ \"$TARGET_CMD\" = \"terminal\" ]; then\n"
+            "  exec /usr/bin/foot -c %s/etc/xdg/foot/foot.ini -l error /bin/bash\n"
+            "fi\n\n"
+            "if [ -z \"$BOX64_BIN\" ] || [ -z \"$WINE_BIN\" ]; then\n"
+            "  echo \"[ENGINE] Komponen Box64 / Wine belum ditemukan di rootfs ini.\"\n"
+            "  echo \"[ENGINE] Silakan unduh dan pilih paket rootfs v2.0.0-rootfs terbaru dari GitHub Releases.\"\n"
+            "  if [ -x /usr/bin/foot ]; then\n"
+            "    exec /usr/bin/foot -c %s/etc/xdg/foot/foot.ini -l error /bin/bash -c 'echo \"=== NATIVE GAME ENGINE DIAGNOSTICS ===\"; echo \"Box64 & Wine belum terpasang di rootfs lama ini.\"; echo \"Unduh nativedesktop-ubuntu-arm64.tar.gz dari Release v2.0.0-rootfs.\"; echo \"\"; exec /bin/bash'\n"
+            "  fi\n"
+            "  exit 1\n"
+            "fi\n\n"
+            "if [ ! -d \"$WINEPREFIX/drive_c\" ]; then\n"
+            "  echo \"[ENGINE] Menginisialisasi Wine Prefix (64-bit WoW64)...\"\n"
+            "  mkdir -p \"$WINEPREFIX/dosdevices\"\n"
+            "  \"$BOX64_BIN\" \"$WINE_BIN\" wineboot --init || true\n"
+            "  ln -sfn \"/storage/emulated/0/Download\" \"$WINEPREFIX/dosdevices/d:\" 2>/dev/null || true\n"
+            "  ln -sfn \"%s/games\" \"$WINEPREFIX/dosdevices/e:\" 2>/dev/null || true\n"
+            "fi\n\n"
+            "if [ \"${ND_DISPLAY_MODE:-wayland_direct}\" = \"wayland_direct\" ]; then\n"
+            "  unset DISPLAY\n"
+            "  \"$BOX64_BIN\" \"$WINE_BIN\" reg add \"HKCU\\\\Software\\\\Wine\\\\Drivers\" /v Graphics /t REG_SZ /d wayland /f >/dev/null 2>&1 || true\n"
+            "fi\n\n"
+            "if [ \"${ND_DX_WRAPPER:-dxvk}\" = \"dxvk\" ] && [ -d /opt/dxvk/x64 ]; then\n"
+            "  if [ ! -f \"$WINEPREFIX/.dxvk_installed\" ]; then\n"
+            "    echo \"[ENGINE] Memasang modul DXVK ke system32/syswow64...\"\n"
+            "    cp -f /opt/dxvk/x64/*.dll \"$WINEPREFIX/drive_c/windows/system32/\" 2>/dev/null || true\n"
+            "    if [ -d \"$WINEPREFIX/drive_c/windows/syswow64\" ] && [ -d /opt/dxvk/x32 ]; then\n"
+            "      cp -f /opt/dxvk/x32/*.dll \"$WINEPREFIX/drive_c/windows/syswow64/\" 2>/dev/null || true\n"
+            "    fi\n"
+            "    touch \"$WINEPREFIX/.dxvk_installed\"\n"
+            "  fi\n"
+            "  export WINEDLLOVERRIDES=\"d3d11,d3d10core,d3d9,dxgi=n,b\"\n"
+            "else\n"
+            "  export WINEDLLOVERRIDES=\"d3d11,d3d10core,d3d9,dxgi=b\"\n"
+            "fi\n\n"
+            "if [ \"${ND_DISPLAY_MODE:-wayland_direct}\" = \"kiosk_xwayland\" ] && [ -x /usr/bin/weston ]; then\n"
+            "  /usr/bin/weston --backend=wayland-backend.so --use-pixman --fullscreen --config=%s/etc/xdg/weston/weston-kiosk.ini &\n"
+            "  sleep 1\n"
+            "  export DISPLAY=:0\n"
+            "fi\n\n"
+            "echo \"[ENGINE] Meluncurkan eksekusi Windows: $TARGET_CMD $*\"\n"
+            "exec \"$BOX64_BIN\" \"$WINE_BIN\" \"$TARGET_CMD\" \"$@\"\n",
+            rootfs,
+            rootfs,
+            rootfs,
+            rootfs,
+            rootfs
+        );
+        fclose(rfp);
+        chmod(runner_path, 0755);
+    }
 }
 
 static void prepare_rootfs_binaries(const char *rootfs, const char *ld_path, const char *exec_path) {
     patch_arm64_seccomp_syscalls(ld_path);
     patch_arm64_seccomp_syscalls(exec_path);
-    write_weston_config(rootfs);
+    write_engine_configs(rootfs);
 
     const char *scan_dirs[] = {
+        "/usr/local/bin",
         "/usr/bin",
         "/bin",
         "/usr/libexec",
@@ -298,6 +460,50 @@ static void prepare_rootfs_binaries(const char *rootfs, const char *ld_path, con
     for (size_t i = 0; i < sizeof(scan_dirs) / sizeof(scan_dirs[0]); ++i) {
         snprintf(dir_path, sizeof(dir_path), "%s%s", rootfs, scan_dirs[i]);
         patch_directory_recursive(dir_path, 0);
+    }
+}
+
+static void apply_performance_cpu_affinity(void) {
+    long max_freqs[16];
+    long min_freq = 0x7fffffffL;
+    long peak_freq = 0;
+    int valid_cores = 0;
+
+    for (int i = 0; i < 16; ++i) {
+        max_freqs[i] = -1;
+        char path[128];
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", i);
+        int fd = open(path, O_RDONLY);
+        if (fd >= 0) {
+            char buf[32];
+            ssize_t n = read(fd, buf, sizeof(buf) - 1);
+            close(fd);
+            if (n > 0) {
+                buf[n] = '\0';
+                long f = atol(buf);
+                if (f > 0) {
+                    max_freqs[i] = f;
+                    if (f < min_freq) min_freq = f;
+                    if (f > peak_freq) peak_freq = f;
+                    valid_cores++;
+                }
+            }
+        }
+    }
+
+    if (valid_cores > 1 && peak_freq > min_freq) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        int big_count = 0;
+        for (int i = 0; i < 16; ++i) {
+            if (max_freqs[i] > min_freq) {
+                CPU_SET(i, &set);
+                big_count++;
+            }
+        }
+        if (big_count > 0) {
+            sched_setaffinity(0, sizeof(set), &set);
+        }
     }
 }
 
@@ -348,12 +554,12 @@ static void *log_reader_worker(void *arg) {
         int exit_code = -1;
         if (WIFEXITED(status)) {
             exit_code = WEXITSTATUS(status);
-            snprintf(exit_msg, sizeof(exit_msg), "Proses guest keluar normal dengan kode: %d", exit_code);
+            snprintf(exit_msg, sizeof(exit_msg), "Proses engine selesai dengan kode: %d", exit_code);
         } else if (WIFSIGNALED(status)) {
             exit_code = 128 + WTERMSIG(status);
-            snprintf(exit_msg, sizeof(exit_msg), "Proses guest dihentikan oleh sinyal: %d", WTERMSIG(status));
+            snprintf(exit_msg, sizeof(exit_msg), "Proses engine dihentikan sinyal: %d", WTERMSIG(status));
         } else {
-            snprintf(exit_msg, sizeof(exit_msg), "Proses guest keluar dengan status tak dikenal.");
+            snprintf(exit_msg, sizeof(exit_msg), "Proses engine berhenti.");
         }
         append_log_line(exit_msg);
         notify_process_exit(exit_code, exit_msg);
@@ -403,7 +609,27 @@ static void on_frame_render(const uint8_t *pixels, int width, int height, int st
 
     if (!pixels || width <= 0 || height <= 0 || stride <= 0) return;
 
+    uint64_t now_ns = monotonic_now_ns();
+
     pthread_mutex_lock(&s_render_lock);
+    if (s_last_frame_ts_ns > 0 && now_ns > s_last_frame_ts_ns) {
+        s_measured_frametime_ms = (float)(now_ns - s_last_frame_ts_ns) / 1000000.0f;
+    }
+    s_last_frame_ts_ns = now_ns;
+
+    if (s_fps_window_start_ns == 0) {
+        s_fps_window_start_ns = now_ns;
+        s_fps_window_frames = 1;
+    } else {
+        s_fps_window_frames++;
+        uint64_t elapsed_ns = now_ns - s_fps_window_start_ns;
+        if (elapsed_ns >= 500000000ULL) {
+            s_measured_fps = ((float)s_fps_window_frames * 1000000000.0f) / (float)elapsed_ns;
+            s_fps_window_start_ns = now_ns;
+            s_fps_window_frames = 0;
+        }
+    }
+
     size_t needed = (size_t)stride * (size_t)height;
     if (needed > s_last_frame_cap) {
         uint8_t *new_buf = (uint8_t *)realloc(s_last_frame, needed);
@@ -453,6 +679,47 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
     return JNI_VERSION_1_6;
 }
 
+JNIEXPORT void JNICALL
+Java_com_core_desktop_data_repository_DesktopEngineRepository_nativeSetResolution(
+    JNIEnv *env, jobject thiz, jint width, jint height) {
+    (void)env;
+    (void)thiz;
+
+    if (width <= 0 || height <= 0) return;
+
+    pthread_mutex_lock(&s_lock);
+    s_target_res_w = (int)width;
+    s_target_res_h = (int)height;
+    if (s_server) {
+        wayland_server_set_output_size(s_server, s_target_res_w, s_target_res_h);
+    }
+    pthread_mutex_unlock(&s_lock);
+}
+
+JNIEXPORT jfloatArray JNICALL
+Java_com_core_desktop_data_repository_DesktopEngineRepository_nativeGetPerfMetrics(
+    JNIEnv *env, jobject thiz) {
+    (void)thiz;
+
+    float metrics[4];
+    pthread_mutex_lock(&s_render_lock);
+    uint64_t now_ns = monotonic_now_ns();
+    if (s_last_frame_ts_ns > 0 && (now_ns - s_last_frame_ts_ns) > 2000000000ULL) {
+        s_measured_fps = 0.0f;
+    }
+    metrics[0] = s_measured_fps;
+    metrics[1] = s_measured_frametime_ms;
+    metrics[2] = (float)(s_last_frame_w > 0 ? s_last_frame_w : s_target_res_w);
+    metrics[3] = (float)(s_last_frame_h > 0 ? s_last_frame_h : s_target_res_h);
+    pthread_mutex_unlock(&s_render_lock);
+
+    jfloatArray out = (*env)->NewFloatArray(env, 4);
+    if (out) {
+        (*env)->SetFloatArrayRegion(env, out, 0, 4, metrics);
+    }
+    return out;
+}
+
 JNIEXPORT jboolean JNICALL
 Java_com_core_desktop_data_repository_DesktopEngineRepository_nativeInit(
     JNIEnv *env, jobject thiz, jstring socket_dir, jstring socket_name) {
@@ -474,6 +741,11 @@ Java_com_core_desktop_data_repository_DesktopEngineRepository_nativeInit(
     s_last_frame_w = 0;
     s_last_frame_h = 0;
     s_last_frame_stride = 0;
+    s_last_frame_ts_ns = 0;
+    s_fps_window_start_ns = 0;
+    s_fps_window_frames = 0;
+    s_measured_fps = 0.0f;
+    s_measured_frametime_ms = 0.0f;
     pthread_mutex_unlock(&s_render_lock);
 
     if (s_server) {
@@ -490,14 +762,11 @@ Java_com_core_desktop_data_repository_DesktopEngineRepository_nativeInit(
         return JNI_FALSE;
     }
 
-    pthread_mutex_lock(&s_render_lock);
-    int win_w = s_window ? ANativeWindow_getWidth(s_window) : 0;
-    int win_h = s_window ? ANativeWindow_getHeight(s_window) : 0;
-    pthread_mutex_unlock(&s_render_lock);
-
-    if (win_w > 0 && win_h > 0) {
-        wayland_server_set_output_size(s_server, win_w, win_h);
-    }
+    wayland_server_set_output_size(
+        s_server,
+        s_target_res_w > 0 ? s_target_res_w : 1280,
+        s_target_res_h > 0 ? s_target_res_h : 720
+    );
 
     wayland_server_set_render_callback(s_server, on_frame_render, NULL);
     int res = wayland_server_start(s_server);
@@ -515,9 +784,6 @@ Java_com_core_desktop_data_repository_DesktopEngineRepository_nativeSetSurface(
     JNIEnv *env, jobject thiz, jobject surface) {
     (void)thiz;
 
-    int win_w = 0;
-    int win_h = 0;
-
     pthread_mutex_lock(&s_render_lock);
     if (s_window) {
         ANativeWindow_release(s_window);
@@ -527,23 +793,12 @@ Java_com_core_desktop_data_repository_DesktopEngineRepository_nativeSetSurface(
     if (surface) {
         s_window = ANativeWindow_fromSurface(env, surface);
         if (s_window) {
-            win_w = ANativeWindow_getWidth(s_window);
-            win_h = ANativeWindow_getHeight(s_window);
-            // Immediately render cached frame if guest already committed before SurfaceView was ready
             if (s_last_frame && s_last_frame_w > 0 && s_last_frame_h > 0) {
                 blit_frame_to_window_locked(s_last_frame, s_last_frame_w, s_last_frame_h, s_last_frame_stride);
             }
         }
     }
     pthread_mutex_unlock(&s_render_lock);
-
-    if (win_w > 0 && win_h > 0) {
-        pthread_mutex_lock(&s_lock);
-        if (s_server) {
-            wayland_server_set_output_size(s_server, win_w, win_h);
-        }
-        pthread_mutex_unlock(&s_lock);
-    }
 }
 
 JNIEXPORT void JNICALL
@@ -570,6 +825,19 @@ Java_com_core_desktop_data_repository_DesktopEngineRepository_nativeInjectKey(
         wayland_server_inject_key(s_server, (int)linux_keycode, (bool)pressed, (bool)shift_mod);
     }
     pthread_mutex_unlock(&s_lock);
+}
+
+static bool is_file_elf_arm64(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return false;
+    unsigned char hdr[20];
+    ssize_t n = read(fd, hdr, sizeof(hdr));
+    close(fd);
+    if (n >= 20 && hdr[0] == 0x7f && hdr[1] == 'E' && hdr[2] == 'L' && hdr[3] == 'F') {
+        uint16_t machine = (uint16_t)hdr[18] | ((uint16_t)hdr[19] << 8);
+        return (machine == EM_AARCH64);
+    }
+    return false;
 }
 
 JNIEXPORT jboolean JNICALL
@@ -600,49 +868,82 @@ Java_com_core_desktop_data_repository_DesktopEngineRepository_nativeStartSession
 
     char lib_path[PATH_MAX * 3];
     snprintf(lib_path, sizeof(lib_path),
-             "%s/usr/lib/aarch64-linux-gnu:%s/lib/aarch64-linux-gnu:%s/usr/lib:%s/lib:"
+             "%s/usr/lib/aarch64-linux-gnu:%s/lib/aarch64-linux-gnu:%s/usr/local/lib:%s/usr/lib:%s/lib:"
              "%s/usr/lib/aarch64-linux-gnu/libweston-13:%s/usr/lib/aarch64-linux-gnu/libweston-12:"
              "%s/usr/lib/aarch64-linux-gnu/libweston-10:%s/usr/lib/aarch64-linux-gnu/weston:"
-             "%s/usr/lib/x86_64-linux-gnu",
+             "%s/opt/wine/lib:%s/opt/wine/lib64:%s/usr/lib/x86_64-linux-gnu",
+             c_rootfs, c_rootfs, c_rootfs, c_rootfs, c_rootfs,
              c_rootfs, c_rootfs, c_rootfs, c_rootfs,
-             c_rootfs, c_rootfs, c_rootfs, c_rootfs, c_rootfs);
+             c_rootfs, c_rootfs, c_rootfs);
 
     int arg_count = (*env)->GetArrayLength(env, args);
     size_t exec_len = strlen(c_exec);
     bool is_weston = (exec_len >= 7 && strcmp(c_exec + exec_len - 7, "/weston") == 0);
+    bool direct_arm64_elf = is_file_elf_arm64(c_exec);
+
+    char bash_bin[PATH_MAX];
+    snprintf(bash_bin, sizeof(bash_bin), "%s/bin/bash", c_rootfs);
+    if (access(bash_bin, X_OK) != 0) {
+        snprintf(bash_bin, sizeof(bash_bin), "%s/bin/sh", c_rootfs);
+    }
 
     char weston_cfg_arg[PATH_MAX];
     snprintf(weston_cfg_arg, sizeof(weston_cfg_arg), "--config=%s/etc/xdg/weston/weston.ini", c_rootfs);
 
-    int extra_weston_args = (is_weston && arg_count == 0) ? 4 : 0;
-    char **argv = (char **)calloc((size_t)arg_count + (size_t)extra_weston_args + 5, sizeof(char *));
-    argv[0] = strdup(ld_path);
-    argv[1] = strdup("--library-path");
-    argv[2] = strdup(lib_path);
-    argv[3] = strdup(c_exec);
+    char **argv = (char **)calloc((size_t)arg_count + 12, sizeof(char *));
+    int a_idx = 0;
+    argv[a_idx++] = strdup(ld_path);
+    argv[a_idx++] = strdup("--library-path");
+    argv[a_idx++] = strdup(lib_path);
 
-    if (is_weston && arg_count == 0) {
-        argv[4] = strdup("--backend=wayland-backend.so");
-        argv[5] = strdup("--use-pixman");
-        argv[6] = strdup("--fullscreen");
-        argv[7] = strdup(weston_cfg_arg);
-        argv[8] = NULL;
+    if (direct_arm64_elf) {
+        argv[a_idx++] = strdup(c_exec);
+        if (is_weston && arg_count == 0) {
+            argv[a_idx++] = strdup("--backend=wayland-backend.so");
+            argv[a_idx++] = strdup("--use-pixman");
+            argv[a_idx++] = strdup("--fullscreen");
+            argv[a_idx++] = strdup(weston_cfg_arg);
+        } else {
+            for (int i = 0; i < arg_count; ++i) {
+                jstring arg = (jstring)(*env)->GetObjectArrayElement(env, args, i);
+                const char *arg_str = (*env)->GetStringUTFChars(env, arg, NULL);
+                argv[a_idx++] = strdup(arg_str);
+                (*env)->ReleaseStringUTFChars(env, arg, arg_str);
+                (*env)->DeleteLocalRef(env, arg);
+            }
+        }
     } else {
+        // Script (/usr/local/bin/game-runner) or Windows .exe launched via bash + game-runner
+        argv[a_idx++] = strdup(bash_bin);
+        bool is_exe = (exec_len >= 4 &&
+                       (strcasecmp(c_exec + exec_len - 4, ".exe") == 0 ||
+                        strcasecmp(c_exec + exec_len - 4, ".msi") == 0 ||
+                        strcasecmp(c_exec + exec_len - 4, ".bat") == 0));
+        if (is_exe) {
+            char runner_script[PATH_MAX];
+            snprintf(runner_script, sizeof(runner_script), "%s/usr/local/bin/game-runner", c_rootfs);
+            argv[a_idx++] = strdup(runner_script);
+        }
+        argv[a_idx++] = strdup(c_exec);
         for (int i = 0; i < arg_count; ++i) {
             jstring arg = (jstring)(*env)->GetObjectArrayElement(env, args, i);
             const char *arg_str = (*env)->GetStringUTFChars(env, arg, NULL);
-            argv[i + 4] = strdup(arg_str);
+            argv[a_idx++] = strdup(arg_str);
             (*env)->ReleaseStringUTFChars(env, arg, arg_str);
             (*env)->DeleteLocalRef(env, arg);
         }
-        argv[arg_count + 4] = NULL;
     }
+    argv[a_idx] = NULL;
 
+    bool lock_perf_cores = true;
     int custom_env_count = (*env)->GetArrayLength(env, env_vars);
-    char **envp = (char **)calloc((size_t)custom_env_count + 32, sizeof(char *));
+    char **envp = (char **)calloc((size_t)custom_env_count + 40, sizeof(char *));
     for (int i = 0; i < custom_env_count; ++i) {
         jstring var = (jstring)(*env)->GetObjectArrayElement(env, env_vars, i);
         const char *var_str = (*env)->GetStringUTFChars(env, var, NULL);
+        if (strncmp(var_str, "ND_PERF_CORES=0", 15) == 0) {
+            lock_perf_cores = false;
+        }
         envp[i] = strdup(var_str);
         (*env)->ReleaseStringUTFChars(env, var, var_str);
         (*env)->DeleteLocalRef(env, var);
@@ -700,7 +1001,7 @@ Java_com_core_desktop_data_repository_DesktopEngineRepository_nativeStartSession
     envp[idx++] = strdup("LOGNAME=root");
     envp[idx++] = strdup("SHELL=/bin/bash");
     envp[idx++] = strdup("TERM=xterm-256color");
-    envp[idx++] = strdup("PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin:/usr/libexec");
+    envp[idx++] = strdup("PATH=/opt/wine/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin:/usr/libexec");
     envp[idx++] = strdup("LANG=C.UTF-8");
     envp[idx++] = strdup("LC_ALL=C.UTF-8");
     envp[idx] = NULL;
@@ -725,7 +1026,8 @@ Java_com_core_desktop_data_repository_DesktopEngineRepository_nativeStartSession
     }
 
     char start_log[512];
-    snprintf(start_log, sizeof(start_log), "[SYSTEM] Meluncurkan biner via ld.so: %s %s", ld_path, c_exec);
+    snprintf(start_log, sizeof(start_log), "[ENGINE] Memulai pipeline native (%dx%d): %s",
+             s_target_res_w, s_target_res_h, c_exec);
     append_log_line(start_log);
 
     pid_t pid = fork();
@@ -739,6 +1041,21 @@ Java_com_core_desktop_data_repository_DesktopEngineRepository_nativeStartSession
 
         close(stdin_pipe[0]);
         close(pipefd[1]);
+
+        // Raise open file descriptor limit for Wine Esync/Fsync
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+            rl.rlim_cur = rl.rlim_max > 65536 ? 65536 : rl.rlim_max;
+            setrlimit(RLIMIT_NOFILE, &rl);
+        }
+
+        // Minimize timer slack for game loop frame pacing
+        prctl(PR_SET_TIMERSLACK, 1UL, 0UL, 0UL, 0UL);
+
+        // Pin to Performance/Prime CPU cores across MediaTek Dimensity / Snapdragon / Exynos
+        if (lock_perf_cores) {
+            apply_performance_cpu_affinity();
+        }
 
         chdir(c_rootfs);
 
@@ -759,31 +1076,6 @@ Java_com_core_desktop_data_repository_DesktopEngineRepository_nativeStartSession
     s_child_pid = pid;
     s_log_pipe_fd = pipefd[0];
     pthread_mutex_unlock(&s_lock);
-
-    // If launching an interactive shell (/bin/sh, /bin/bash, /bin/dash) with no arguments,
-    // automatically start Weston or Foot if installed, or print diagnostic instructions.
-    if (pid > 0 && arg_count == 0 &&
-        ((exec_len >= 3 && strcmp(c_exec + exec_len - 3, "/sh") == 0) ||
-         (exec_len >= 5 && strcmp(c_exec + exec_len - 5, "/bash") == 0) ||
-         (exec_len >= 5 && strcmp(c_exec + exec_len - 5, "/dash") == 0))) {
-        char init_cmd[1024];
-        snprintf(init_cmd, sizeof(init_cmd),
-            "echo \"[GUEST] Shell Linux aktif ($(uname -srm))\";\n"
-            "if [ -x /usr/bin/weston ]; then\n"
-            "  echo \"[GUEST] Meluncurkan Weston Wayland Desktop...\";\n"
-            "  /usr/bin/weston --backend=wayland-backend.so --use-pixman --fullscreen --config=%s/etc/xdg/weston/weston.ini || /usr/bin/foot;\n"
-            "elif [ -x /usr/bin/foot ]; then\n"
-            "  echo \"[GUEST] Meluncurkan terminal grafis Foot...\";\n"
-            "  /usr/bin/foot;\n"
-            "else\n"
-            "  echo \"[GUEST] /usr/bin/weston belum ditemukan di rootfs ini.\";\n"
-            "  echo \"[GUEST] Silakan tekan Hentikan Sesi lalu Pilih Berkas Rootfs (.tar.gz) ulang untuk mengekstrak penuh nativedesktop-ubuntu-arm64.tar.gz.\";\n"
-            "fi\n",
-            c_rootfs
-        );
-        ssize_t written = write(s_stdin_pipe_fd, init_cmd, strlen(init_cmd));
-        (void)written;
-    }
 
     if (pthread_create(&s_log_thread, NULL, log_reader_worker, (void *)(intptr_t)s_log_pipe_fd) == 0) {
         pthread_detach(s_log_thread);
@@ -853,6 +1145,8 @@ Java_com_core_desktop_data_repository_DesktopEngineRepository_nativeStopSession(
         ANativeWindow_release(s_window);
         s_window = NULL;
     }
+    s_measured_fps = 0.0f;
+    s_measured_frametime_ms = 0.0f;
     pthread_mutex_unlock(&s_render_lock);
     pthread_mutex_unlock(&s_lock);
 }

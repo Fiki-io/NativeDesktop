@@ -1,44 +1,102 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Native Desktop</string>
-    <string name="title_configuration">Konfigurasi Desktop</string>
-    <string name="desc_configuration">Atur jalur rootfs Linux dan biner sesi desktop untuk memulai.</string>
-    
-    <string name="title_console_logs">Log Konsol Sistem</string>
-    <string name="desc_console_logs">Keluaran teks stdout/stderr dari proses Linux guest.</string>
-    <string name="empty_console_logs">Belum ada aktivitas. Tekan Jalankan Sesi Desktop untuk memulai.</string>
-    
+    <string name="title_configuration">Konfigurasi Game Engine</string>
+    <string name="desc_configuration">Pipeline eksekusi Windows x86_64/x86 langsung di atas Wayland dan Box64 untuk semua SoC.</string>
+
+    <string name="section_hardware_detected">Profil Hardware Perangkat</string>
+    <string name="label_soc_detected">SoC &amp; Platform</string>
+    <string name="label_gpu_node_detected">Jalur Driver GPU</string>
+    <string name="label_cpu_topology_detected">Topologi CPU</string>
+
+    <string name="section_game_target">Target Eksekusi &amp; Container</string>
+    <string name="btn_select_rootfs">Pasang Paket Rootfs Engine (.tar.gz)</string>
+    <string name="btn_select_game_exe">Impor Berkas Game (.exe / .msi / .bat)</string>
+
+    <string name="label_game_target">Target Eksekusi Windows / Wine</string>
+    <string name="hint_game_target">Contoh: /games/game.exe atau winecfg</string>
+
+    <string name="preset_target_winecfg">Wine Config</string>
+    <string name="preset_target_explorer">Wine Explorer</string>
+    <string name="preset_target_cmd">Wine Console</string>
+    <string name="preset_target_terminal">Terminal Linux</string>
+
+    <string name="section_graphics_tuning">Grafis &amp; Performa Multi-SoC</string>
+    <string name="label_gpu_backend">Backend Vulkan / GPU SoC</string>
+    <string name="gpu_backend_auto">Otomatis (Sesuai SoC)</string>
+    <string name="gpu_backend_mali">Universal Mali / Immortalis / Xclipse</string>
+    <string name="gpu_backend_turnip">Turnip KGSL (Snapdragon Adreno)</string>
+    <string name="gpu_backend_lvp">Mesa Lavapipe (Kompatibilitas CPU)</string>
+
+    <string name="label_dx_wrapper">Translator DirectX</string>
+    <string name="dx_wrapper_dxvk">DXVK Async (Vulkan D3D9/10/11)</string>
+    <string name="dx_wrapper_wined3d">WineD3D Universal</string>
+
+    <string name="label_dynarec_preset">Profil Box64 Dynarec</string>
+    <string name="dynarec_performance">Performa Maksimal (BigBlock 3 + FastMath)</string>
+    <string name="dynarec_balanced">Seimbang (BigBlock 2 + SafeFlags 1)</string>
+    <string name="dynarec_stability">Stabilitas Tinggi (StrongMem 2)</string>
+
+    <string name="label_render_resolution">Resolusi Render Internal</string>
+
+    <string name="label_display_mode">Mode Jalur Layar</string>
+    <string name="display_mode_wayland">Direct Wine Wayland (Tanpa X11)</string>
+    <string name="display_mode_kiosk">Kiosk Xwayland Fullscreen</string>
+
+    <string name="label_toggle_esync">Wine Esync &amp; Fsync</string>
+    <string name="desc_toggle_esync">Sinkronisasi eventfd langsung di kernel untuk menekan latensi thread game.</string>
+
+    <string name="label_toggle_perf_cores">Kunci Performance / Prime CPU Cores</string>
+    <string name="desc_toggle_perf_cores">Jalankan thread game hanya pada core berfrekuensi tinggi (big.LITTLE).</string>
+
     <string name="label_rootfs_path">Jalur Direktori Rootfs</string>
     <string name="hint_rootfs_path">Contoh: /data/data/com.core.desktop/files/rootfs</string>
-    
-    <string name="label_executable_path">Biner Sesi</string>
-    <string name="hint_executable_path">Contoh: /usr/bin/weston atau /bin/sh</string>
-    
-    <string name="label_session_args">Argumen Tambahan</string>
-    <string name="hint_session_args">Pisahkan dengan spasi, contoh: --backend=wayland</string>
 
-    <string name="btn_start_session">Jalankan Sesi Desktop</string>
-    <string name="btn_stop_session">Hentikan Sesi</string>
+    <string name="label_session_args">Argumen Peluncuran Tambahan</string>
+    <string name="hint_session_args">Contoh: -windowed -dx11</string>
+
+    <string name="title_console_logs">Log Telemetry &amp; Engine</string>
+    <string name="desc_console_logs">Keluaran real-time dari Box64, Wine, DXVK, dan Wayland server.</string>
+    <string name="empty_console_logs">Belum ada aktivitas. Tekan Luncurkan Game untuk memulai sesi.</string>
+
+    <string name="btn_start_session">Luncurkan Game</string>
+    <string name="btn_stop_session">Keluar</string>
     <string name="btn_toggle_keyboard">Keyboard</string>
-    <string name="btn_show_logs">Lihat Log</string>
+    <string name="btn_toggle_gamepad">Gamepad</string>
+    <string name="btn_show_logs">Log</string>
     <string name="btn_hide_logs">Tutup Log</string>
-    <string name="btn_reset_defaults">Gunakan Jalur Default</string>
-    <string name="btn_select_rootfs">Pilih Berkas Rootfs (.tar.gz)</string>
+    <string name="btn_reset_defaults">Reset Profil</string>
 
-    <string name="status_idle">Siap</string>
-    <string name="status_starting">Menginisialisasi Wayland server dan memuat biner...</string>
-    <string name="status_extracting">Mengekstrak berkas sistem...</string>
-    <string name="status_extract_success">Rootfs berhasil diekstrak dan siap dijalankan.</string>
-    <string name="status_running">Sesi desktop aktif</string>
+    <string name="hud_fps_format">%1$.1f FPS  |  %2$.1f ms  |  %3$dx%4$d</string>
+
+    <string name="pad_up">W</string>
+    <string name="pad_left">A</string>
+    <string name="pad_down">S</string>
+    <string name="pad_right">D</string>
+    <string name="pad_space">SPACE</string>
+    <string name="pad_enter">ENTER</string>
+    <string name="pad_esc">ESC</string>
+    <string name="pad_shift">SHIFT</string>
+    <string name="pad_e">E</string>
+    <string name="pad_r">R</string>
+    <string name="pad_lmb">L-CLICK</string>
+    <string name="pad_rmb">R-CLICK</string>
+
+    <string name="status_idle">Engine Siap</string>
+    <string name="status_starting">Menginisialisasi Wayland Direct, Box64, dan Wine...</string>
+    <string name="status_extracting">Mengekstrak paket rootfs engine...</string>
+    <string name="status_extract_success">Rootfs engine siap dijalankan.</string>
+    <string name="status_running">Sesi game aktif</string>
     <string name="status_error">Terjadi kegagalan: %1$s</string>
 
-    <string name="error_rootfs_not_found">Direktori rootfs belum terpasang. Silakan pilih berkas arsip rootfs (.tar.gz) terlebih dahulu.</string>
-    <string name="error_executable_not_found">File biner yang ditentukan tidak ditemukan atau tidak memiliki izin eksekusi.</string>
-    <string name="error_wayland_init_failed">Gagal menginisialisasi UNIX domain socket untuk Wayland server.</string>
-    <string name="error_session_start_failed">Gagal meluncurkan proses biner guest Linux.</string>
-    <string name="error_extract_failed">Gagal mengekstrak berkas rootfs: %1$s</string>
+    <string name="error_rootfs_not_found">Direktori rootfs belum terpasang. Pilih paket rootfs (.tar.gz) terlebih dahulu.</string>
+    <string name="error_executable_not_found">Komponen runtime di dalam rootfs belum lengkap.</string>
+    <string name="error_wayland_init_failed">Gagal menginisialisasi Wayland socket server.</string>
+    <string name="error_session_start_failed">Gagal meluncurkan proses engine.</string>
+    <string name="error_extract_failed">Gagal mengekstrak rootfs: %1$s</string>
+    <string name="error_game_file_open_failed">Gagal membaca berkas game yang dipilih.</string>
+    <string name="error_game_file_empty">Berkas game yang dipilih kosong atau tidak valid.</string>
 
-    <string name="content_desc_status_icon">Indikator status sesi</string>
-    <string name="content_desc_stop_fab">Tombol hentikan sesi desktop</string>
+    <string name="content_desc_status_icon">Indikator status engine</string>
+    <string name="content_desc_stop_fab">Tombol hentikan sesi game</string>
 </resources>
-
